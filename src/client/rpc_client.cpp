@@ -2,6 +2,7 @@
 
 #include <exception>
 #include <utility>
+#include <vector>
 
 #include "minirpc/protocol/body_codec.h"
 
@@ -18,10 +19,7 @@ RpcClient::~RpcClient() { Close(); }
 
 Status RpcClient::Connect() { return tcp_client_.Connect(endpoint_); }
 
-void RpcClient::Close() {
-    tcp_client_.Close();
-    FailPending(StatusCode::kNetworkError, "connection closed");
-}
+void RpcClient::Close() { tcp_client_.Close(); }
 
 RpcResponse RpcClient::Call(const std::string& service_name,
                             const std::string& method_name,
@@ -49,11 +47,11 @@ RpcResponse RpcClient::Call(const std::string& service_name,
         return ErrorResponse(request_id, StatusCode::kSerializeError, ex.what());
     }
 
-    auto promise = std::make_shared<std::promise<RpcResponse>>();
-    auto future = promise->get_future();
+    auto pending = std::make_shared<PendingCall>();
+    auto future = pending->promise.get_future();
     {
         std::lock_guard<std::mutex> lock(pending_mutex_);
-        pending_[request_id] = promise;
+        pending_[request_id] = pending;
     }
 
     Status send_status = tcp_client_.SendFrame(frame);
@@ -62,14 +60,17 @@ RpcResponse RpcClient::Call(const std::string& service_name,
             std::lock_guard<std::mutex> lock(pending_mutex_);
             pending_.erase(request_id);
         }
+        pending->TryComplete(ErrorResponse(request_id, send_status.code(), send_status.message()));
         tcp_client_.Close();
-        return ErrorResponse(request_id, send_status.code(), send_status.message());
+        return future.get();
     }
 
     if (future.wait_for(timeout) != std::future_status::ready) {
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        pending_.erase(request_id);
-        return ErrorResponse(request_id, StatusCode::kTimeout, "rpc call timed out");
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            pending_.erase(request_id);
+        }
+        pending->TryComplete(ErrorResponse(request_id, StatusCode::kTimeout, "rpc call timed out"));
     }
     return future.get();
 }
@@ -86,16 +87,16 @@ void RpcClient::OnFrame(ProtocolFrame frame) {
     } catch (const std::exception& ex) {
         response = ErrorResponse(frame.request_id, StatusCode::kDeserializeError, ex.what());
     }
-    std::shared_ptr<std::promise<RpcResponse>> promise;
+    std::shared_ptr<PendingCall> pending;
     {
         std::lock_guard<std::mutex> lock(pending_mutex_);
         auto it = pending_.find(frame.request_id);
         if (it != pending_.end()) {
-            promise = it->second;
+            pending = std::move(it->second);
             pending_.erase(it);
         }
     }
-    if (promise) promise->set_value(std::move(response));
+    if (pending) pending->TryComplete(std::move(response));
 }
 
 void RpcClient::OnClose(TcpClient::CloseReason, const std::string& message) {
@@ -104,13 +105,15 @@ void RpcClient::OnClose(TcpClient::CloseReason, const std::string& message) {
 }
 
 void RpcClient::FailPending(StatusCode code, const std::string& message) {
-    std::unordered_map<uint64_t, std::shared_ptr<std::promise<RpcResponse>>> pending;
+    std::vector<std::pair<uint64_t, std::shared_ptr<PendingCall>>> drained;
     {
         std::lock_guard<std::mutex> lock(pending_mutex_);
-        pending.swap(pending_);
+        drained.reserve(pending_.size());
+        for (auto& kv : pending_) drained.emplace_back(kv.first, std::move(kv.second));
+        pending_.clear();
     }
-    for (auto& [request_id, promise] : pending) {
-        promise->set_value(ErrorResponse(request_id, code, message));
+    for (auto& [request_id, pending] : drained) {
+        pending->TryComplete(ErrorResponse(request_id, code, message));
     }
 }
 

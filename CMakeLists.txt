@@ -57,6 +57,10 @@ if(MINIRPC_BUILD_TESTS)
     add_executable(tcp_echo_integration_test tests/net/tcp_echo_integration_test.cpp)
     target_link_libraries(tcp_echo_integration_test PRIVATE minirpc::minirpc)
     add_test(NAME tcp_echo_integration_test COMMAND tcp_echo_integration_test)
+
+    add_executable(rpc_client_test tests/client/rpc_client_test.cpp)
+    target_link_libraries(rpc_client_test PRIVATE minirpc::minirpc)
+    add_test(NAME rpc_client_test COMMAND rpc_client_test)
 endif()
 
 if(MINIRPC_BUILD_BENCHMARKS)
