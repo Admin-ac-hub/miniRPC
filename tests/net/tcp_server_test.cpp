@@ -15,8 +15,6 @@
 
 namespace {
 
-#ifdef __linux__
-
 int OccupyPort(uint16_t port) {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     assert(fd != -1);
@@ -103,16 +101,12 @@ void TestCloseConnectionFiresOnCloseExactlyOnce() {
     server.Stop();
 }
 
-#endif  // __linux__
-
 }  // namespace
 
 int main() {
-#ifdef __linux__
     TestStartStopIdempotency();
     TestStartFailsOnOccupiedPort();
     TestSendFrameOnStaleGenerationIsDropped();
     TestCloseConnectionFiresOnCloseExactlyOnce();
-#endif
     return 0;
 }

@@ -13,8 +13,6 @@
 
 namespace {
 
-#ifdef __linux__
-
 void TestSingleEcho() {
     minirpc::TcpServer server;
     server.SetOnFrame([&server](minirpc::ConnectionId id, uint64_t gen, minirpc::ProtocolFrame frame) {
@@ -154,16 +152,12 @@ void TestServerObservesClientClose() {
     server.Stop();
 }
 
-#endif  // __linux__
-
 }  // namespace
 
 int main() {
-#ifdef __linux__
     TestSingleEcho();
     TestLargeFrame();
     TestConcurrentClients();
     TestServerObservesClientClose();
-#endif
     return 0;
 }

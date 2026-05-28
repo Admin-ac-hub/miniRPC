@@ -12,8 +12,6 @@
 
 namespace {
 
-#ifdef __linux__
-
 constexpr int32_t kOk = static_cast<int32_t>(minirpc::StatusCode::kOk);
 constexpr int32_t kTimeout = static_cast<int32_t>(minirpc::StatusCode::kTimeout);
 constexpr int32_t kNetworkError = static_cast<int32_t>(minirpc::StatusCode::kNetworkError);
@@ -129,17 +127,13 @@ void TestServerNotRunning() {
     assert(resp.status_code == kNetworkError);
 }
 
-#endif  // __linux__
-
 }  // namespace
 
 int main() {
-#ifdef __linux__
     TestBasicEcho();
     TestTimeoutCleanup();
     TestConcurrentCalls();
     TestCloseFailsPending();
     TestServerNotRunning();
-#endif
     return 0;
 }

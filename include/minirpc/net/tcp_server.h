@@ -51,7 +51,6 @@ public:
     void CloseConnection(ConnectionId conn_id, uint64_t generation);
 
 private:
-#ifdef __linux__
     struct Connection {
         ConnectionId id = 0;
         int fd = -1;
@@ -89,7 +88,6 @@ private:
     bool SetWriteMode(int client_fd, bool enable);
     void CloseByFd(int client_fd);
     void CloseById(ConnectionId conn_id);
-#endif
 
     std::atomic<bool> running_;
     Endpoint endpoint_;
@@ -98,7 +96,6 @@ private:
     OnFrameFn on_frame_;
     OnCloseFn on_close_;
 
-#ifdef __linux__
     std::thread reactor_thread_;
     int listen_fd_ = -1;
     int epoll_fd_ = -1;
@@ -110,7 +107,6 @@ private:
     mutable std::mutex response_mutex_;
     std::vector<QueuedResponse> response_queue_;
     std::vector<QueuedClose> close_queue_;
-#endif
 };
 
 }  // namespace minirpc

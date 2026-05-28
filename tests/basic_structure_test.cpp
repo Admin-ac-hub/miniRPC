@@ -84,7 +84,6 @@ int main() {
     assert(balancer.Select("EchoService", endpoints).port == 9001);
     assert(balancer.Select("EchoService", endpoints).port == 9002);
 
-#ifdef __linux__
     minirpc::RpcServer server;
     server.RegisterService("EchoService", "Echo", [](const minirpc::RpcRequest& request) {
         minirpc::RpcResponse response;
@@ -139,7 +138,6 @@ int main() {
 
     client.Close();
     server.Stop();
-#endif
 
     return 0;
 }

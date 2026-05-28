@@ -15,8 +15,6 @@
 
 namespace {
 
-#ifdef __linux__
-
 struct TinyListener {
     int listen_fd = -1;
     int accepted_fd = -1;
@@ -115,16 +113,12 @@ void TestSendAfterCloseFails() {
     listener.Stop();
 }
 
-#endif  // __linux__
-
 }  // namespace
 
 int main() {
-#ifdef __linux__
     TestConnectFailureOnDeadEndpoint();
     TestConnectSuccessThenIdempotent();
     TestPeerClosedFiresOnClose();
     TestSendAfterCloseFails();
-#endif
     return 0;
 }

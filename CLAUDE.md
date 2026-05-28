@@ -10,7 +10,7 @@ C++ RPC 框架，作为实习简历项目使用。所有改动按生产代码标
 
 ## 2. 平台
 
-服务端 reactor 用 Linux `epoll + eventfd`，包在 `#ifdef __linux__` 内。macOS 只能编译并跑协议 / 客户端 / 单元测试。**任何需要在 Linux 验证的步骤直接进 docker，不要先在 macOS 上凑合**。
+服务端 reactor 用 Linux `epoll + eventfd`，直接写 Linux 代码，不做 macOS 兼容。**任何需要验证的步骤直接进 docker，不要在 macOS 上凑合**。
 
 容器名 `minirpc-linux`，仓库挂在 `/work`，build 目录已用 Linux 工具链配过。标准流程：
 
@@ -21,7 +21,7 @@ docker exec minirpc-linux bash -c "cd /work && cmake --build build -j && ctest -
 
 容器不在 / 挂载路径不同 / build 目录被 macOS 污染时，先问用户，不要自行 `docker run` 新容器或 `rm -rf build` 重配。
 
-跨平台代码引入新 syscall / header 前确认 macOS + Linux 两端都能编译，否则用 `#ifdef` 隔离。
+代码直接面向 Linux，不做 macOS 兼容守卫。
 
 ## 3. 构建测试
 

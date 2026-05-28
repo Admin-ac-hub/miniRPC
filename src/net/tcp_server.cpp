@@ -6,19 +6,16 @@
 
 #include "minirpc/net/socket_utils.h"
 
-#ifdef __linux__
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#endif
 
 namespace minirpc {
 namespace {
 
-#ifdef __linux__
 constexpr int kMaxEvents = 64;
 constexpr std::size_t kReadChunkSize = 4096;
 
@@ -28,20 +25,16 @@ void CloseFd(int* fd) {
         *fd = -1;
     }
 }
-#endif
 
 }  // namespace
 
 TcpServer::TcpServer()
-    : running_(false)
-#ifdef __linux__
-      ,
+    : running_(false),
       listen_fd_(-1),
       epoll_fd_(-1),
       wake_fd_(-1),
       next_connection_id_(1),
       next_generation_(1)
-#endif
 {}
 
 TcpServer::~TcpServer() { Stop(); }
@@ -56,10 +49,6 @@ Status TcpServer::Start(const Endpoint& endpoint) {
     }
     endpoint_ = endpoint;
 
-#ifndef __linux__
-    return Status::Error(StatusCode::kNetworkError,
-                         "TcpServer epoll reactor is only supported on Linux");
-#else
     Status status = SetupListener();
     if (!status.ok()) {
         Stop();
@@ -68,13 +57,11 @@ Status TcpServer::Start(const Endpoint& endpoint) {
     running_.store(true, std::memory_order_release);
     reactor_thread_ = std::thread([this] { RunEventLoop(); });
     return Status::Ok();
-#endif
 }
 
 void TcpServer::Stop() {
     running_.store(false, std::memory_order_release);
 
-#ifdef __linux__
     if (wake_fd_ != -1) {
         const uint64_t value = 1;
         (void)::write(wake_fd_, &value, sizeof(value));
@@ -94,7 +81,6 @@ void TcpServer::Stop() {
     }
     CloseFd(&epoll_fd_);
     CloseFd(&wake_fd_);
-#endif
 }
 
 bool TcpServer::running() const {
@@ -105,10 +91,6 @@ Status TcpServer::SendFrame(ConnectionId conn_id,
                             uint64_t generation,
                             const ProtocolFrame& frame,
                             bool close_after_send) {
-#ifndef __linux__
-    (void)conn_id; (void)generation; (void)frame; (void)close_after_send;
-    return Status::Error(StatusCode::kNetworkError, "TcpServer is Linux-only");
-#else
     if (!running_.load(std::memory_order_acquire)) {
         return Status::Error(StatusCode::kNetworkError, "TcpServer is stopped");
     }
@@ -128,22 +110,15 @@ Status TcpServer::SendFrame(ConnectionId conn_id,
         return Status::Error(StatusCode::kServerError, "response queue full");
     }
     return Status::Ok();
-#endif
 }
 
 void TcpServer::CloseConnection(ConnectionId conn_id, uint64_t generation) {
-#ifdef __linux__
     {
         std::lock_guard<std::mutex> lock(response_mutex_);
         close_queue_.push_back({conn_id, generation});
     }
     WakeEventLoop();
-#else
-    (void)conn_id; (void)generation;
-#endif
 }
-
-#ifdef __linux__
 
 Status TcpServer::SetupListener() {
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -413,7 +388,5 @@ void TcpServer::CloseById(ConnectionId conn_id) {
     ::close(client_fd);
     if (on_close_) on_close_(conn_id, gen);
 }
-
-#endif  // __linux__
 
 }  // namespace minirpc
