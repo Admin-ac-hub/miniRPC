@@ -1,9 +1,11 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "minirpc/net/tcp_client.h"
@@ -12,6 +14,17 @@
 #include "minirpc/protocol/frame.h"
 
 namespace {
+
+bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (predicate()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return predicate();
+}
 
 void TestSingleEcho() {
     minirpc::TcpServer server;
@@ -152,6 +165,91 @@ void TestServerObservesClientClose() {
     server.Stop();
 }
 
+void TestLargePayloadBurstPreservesOrder() {
+    minirpc::TcpServer server;
+    server.SetOnFrame([&server](minirpc::ConnectionId id, uint64_t gen, minirpc::ProtocolFrame frame) {
+        minirpc::ProtocolFrame resp = frame;
+        resp.message_type = minirpc::MessageType::kResponse;
+        (void)server.SendFrame(id, gen, resp, false);
+    });
+    assert(server.Start({"127.0.0.1", 19404}).ok());
+
+    constexpr int kFrames = 32;
+    const std::string payload(64 * 1024, 'L');
+    std::mutex m;
+    std::vector<std::pair<uint64_t, std::string>> received;
+    minirpc::TcpClient client;
+    client.SetOnFrame([&](minirpc::ProtocolFrame frame) {
+        std::lock_guard<std::mutex> lock(m);
+        received.emplace_back(frame.request_id, std::move(frame.body));
+    });
+    assert(client.Connect({"127.0.0.1", 19404}).ok());
+
+    for (int i = 0; i < kFrames; ++i) {
+        minirpc::ProtocolFrame frame;
+        frame.request_id = static_cast<uint64_t>(i + 1);
+        frame.message_type = minirpc::MessageType::kRequest;
+        frame.body = payload;
+        assert(client.SendFrame(frame).ok());
+    }
+
+    assert(WaitUntil([&] {
+        std::lock_guard<std::mutex> lock(m);
+        return received.size() == kFrames;
+    }, std::chrono::seconds(5)));
+    {
+        std::lock_guard<std::mutex> lock(m);
+        for (int i = 0; i < kFrames; ++i) {
+            assert(received[static_cast<std::size_t>(i)].first == static_cast<uint64_t>(i + 1));
+            assert(received[static_cast<std::size_t>(i)].second == payload);
+        }
+    }
+    client.Close();
+    server.Stop();
+}
+
+void TestSmallPacketHighFrequencyEchoPreservesOrder() {
+    minirpc::TcpServer server;
+    server.SetOnFrame([&server](minirpc::ConnectionId id, uint64_t gen, minirpc::ProtocolFrame frame) {
+        minirpc::ProtocolFrame resp = frame;
+        resp.message_type = minirpc::MessageType::kResponse;
+        (void)server.SendFrame(id, gen, resp, false);
+    });
+    assert(server.Start({"127.0.0.1", 19405}).ok());
+
+    constexpr int kFrames = 512;
+    std::mutex m;
+    std::vector<uint64_t> received_ids;
+    minirpc::TcpClient client;
+    client.SetOnFrame([&](minirpc::ProtocolFrame frame) {
+        std::lock_guard<std::mutex> lock(m);
+        received_ids.push_back(frame.request_id);
+        assert(frame.body.size() == 64);
+    });
+    assert(client.Connect({"127.0.0.1", 19405}).ok());
+
+    for (int i = 0; i < kFrames; ++i) {
+        minirpc::ProtocolFrame frame;
+        frame.request_id = static_cast<uint64_t>(i + 1);
+        frame.message_type = minirpc::MessageType::kRequest;
+        frame.body.assign(64, static_cast<char>('a' + (i % 26)));
+        assert(client.SendFrame(frame).ok());
+    }
+
+    assert(WaitUntil([&] {
+        std::lock_guard<std::mutex> lock(m);
+        return received_ids.size() == kFrames;
+    }, std::chrono::seconds(5)));
+    {
+        std::lock_guard<std::mutex> lock(m);
+        for (int i = 0; i < kFrames; ++i) {
+            assert(received_ids[static_cast<std::size_t>(i)] == static_cast<uint64_t>(i + 1));
+        }
+    }
+    client.Close();
+    server.Stop();
+}
+
 }  // namespace
 
 int main() {
@@ -159,5 +257,7 @@ int main() {
     TestLargeFrame();
     TestConcurrentClients();
     TestServerObservesClientClose();
+    TestLargePayloadBurstPreservesOrder();
+    TestSmallPacketHighFrequencyEchoPreservesOrder();
     return 0;
 }

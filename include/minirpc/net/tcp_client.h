@@ -50,7 +50,6 @@ private:
     OnFrameFn on_frame_;
     OnCloseFn on_close_;
 
-    Endpoint endpoint_;
     std::atomic<bool> closing_;
     std::atomic<bool> close_fired_;
     int fd_;

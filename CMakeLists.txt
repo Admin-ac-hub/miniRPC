@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(miniRPC VERSION 0.1.0 LANGUAGES CXX)
+project(miniRPC VERSION 0.1.0 LANGUAGES CXX ASM)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,17 +11,27 @@ option(MINIRPC_BUILD_TESTS "Build miniRPC tests" ON)
 option(MINIRPC_BUILD_BENCHMARKS "Build miniRPC benchmarks" ON)
 
 find_package(Threads REQUIRED)
+find_package(Protobuf REQUIRED)
 
 file(GLOB_RECURSE MINIRPC_SOURCES CONFIGURE_DEPENDS
     src/*.cpp
 )
 
-add_library(minirpc STATIC ${MINIRPC_SOURCES})
+set(MINIRPC_ASM_SOURCES
+    src/runtime/coctx_swap.S
+)
+
+set(PROTO_FILES proto/minirpc_body.proto)
+protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS ${PROTO_FILES})
+
+add_library(minirpc STATIC ${MINIRPC_SOURCES} ${MINIRPC_ASM_SOURCES} ${PROTO_SRCS})
 add_library(minirpc::minirpc ALIAS minirpc)
 
 target_include_directories(minirpc
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE
+        ${CMAKE_CURRENT_BINARY_DIR}
 )
 
 target_compile_options(minirpc
@@ -29,7 +39,16 @@ target_compile_options(minirpc
         $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-Wall -Wextra -Wpedantic>
 )
 
-target_link_libraries(minirpc PUBLIC Threads::Threads)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    set_source_files_properties(${PROTO_SRCS} PROPERTIES COMPILE_FLAGS "-w")
+endif()
+
+target_link_libraries(minirpc
+    PUBLIC
+        Threads::Threads
+    PRIVATE
+        protobuf::libprotobuf
+)
 
 if(MINIRPC_BUILD_EXAMPLES)
     add_executable(echo_server examples/echo_server.cpp)
@@ -61,6 +80,42 @@ if(MINIRPC_BUILD_TESTS)
     add_executable(rpc_client_test tests/client/rpc_client_test.cpp)
     target_link_libraries(rpc_client_test PRIVATE minirpc::minirpc)
     add_test(NAME rpc_client_test COMMAND rpc_client_test)
+
+    add_executable(metrics_test tests/observability/metrics_test.cpp)
+    target_link_libraries(metrics_test PRIVATE minirpc::minirpc)
+    add_test(NAME metrics_test COMMAND metrics_test)
+
+    add_executable(protobuf_body_codec_test tests/protocol/protobuf_body_codec_test.cpp)
+    target_link_libraries(protobuf_body_codec_test PRIVATE minirpc::minirpc)
+    add_test(NAME protobuf_body_codec_test COMMAND protobuf_body_codec_test)
+
+    add_executable(coroutine_test tests/runtime/coroutine_test.cpp)
+    target_link_libraries(coroutine_test PRIVATE minirpc::minirpc)
+    add_test(NAME coroutine_test COMMAND coroutine_test)
+
+    add_executable(scheduler_test tests/runtime/scheduler_test.cpp)
+    target_link_libraries(scheduler_test PRIVATE minirpc::minirpc)
+    add_test(NAME scheduler_test COMMAND scheduler_test)
+
+    add_executable(timer_queue_test tests/runtime/timer_queue_test.cpp)
+    target_link_libraries(timer_queue_test PRIVATE minirpc::minirpc)
+    add_test(NAME timer_queue_test COMMAND timer_queue_test)
+
+    add_executable(coroutine_io_context_test tests/runtime/coroutine_io_context_test.cpp)
+    target_link_libraries(coroutine_io_context_test PRIVATE minirpc::minirpc)
+    add_test(NAME coroutine_io_context_test COMMAND coroutine_io_context_test)
+
+    add_executable(coroutine_frame_channel_test tests/runtime/coroutine_frame_channel_test.cpp)
+    target_link_libraries(coroutine_frame_channel_test PRIVATE minirpc::minirpc)
+    add_test(NAME coroutine_frame_channel_test COMMAND coroutine_frame_channel_test)
+
+    add_executable(coroutine_rpc_connection_test tests/server/coroutine_rpc_connection_test.cpp)
+    target_link_libraries(coroutine_rpc_connection_test PRIVATE minirpc::minirpc)
+    add_test(NAME coroutine_rpc_connection_test COMMAND coroutine_rpc_connection_test)
+
+    add_executable(coroutine_rpc_server_test tests/server/coroutine_rpc_server_test.cpp)
+    target_link_libraries(coroutine_rpc_server_test PRIVATE minirpc::minirpc)
+    add_test(NAME coroutine_rpc_server_test COMMAND coroutine_rpc_server_test)
 endif()
 
 if(MINIRPC_BUILD_BENCHMARKS)

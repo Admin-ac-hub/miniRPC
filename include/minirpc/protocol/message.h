@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 
@@ -23,6 +24,7 @@ struct RpcRequest {
     std::string service_name;
     std::string method_name;
     std::string payload;
+    int64_t deadline_unix_ms = 0;
 };
 
 struct RpcResponse {
@@ -33,4 +35,3 @@ struct RpcResponse {
 };
 
 }  // namespace minirpc
-

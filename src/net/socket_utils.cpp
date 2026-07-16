@@ -4,7 +4,6 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sys/socket.h>
-#include <unistd.h>
 
 namespace minirpc {
 
@@ -32,12 +31,7 @@ bool SetNonBlocking(int fd, std::string* error) {
 SendResult SendAll(int fd, const char* data, std::size_t size) {
     SendResult result;
     while (result.sent < size) {
-#ifdef MSG_NOSIGNAL
-        constexpr int flags = MSG_NOSIGNAL;
-#else
-        constexpr int flags = 0;
-#endif
-        const ssize_t n = ::send(fd, data + result.sent, size - result.sent, flags);
+        const ssize_t n = ::send(fd, data + result.sent, size - result.sent, MSG_NOSIGNAL);
         if (n > 0) {
             result.sent += static_cast<std::size_t>(n);
             continue;

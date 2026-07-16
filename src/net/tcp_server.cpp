@@ -1,13 +1,13 @@
 #include "minirpc/net/tcp_server.h"
 
 #include <cerrno>
-#include <cstring>
+#include <sstream>
 #include <utility>
 
 #include "minirpc/net/socket_utils.h"
+#include "minirpc/observability/logger.h"
 
 #include <arpa/inet.h>
-#include <fcntl.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
@@ -30,19 +30,15 @@ void CloseFd(int* fd) {
 
 TcpServer::TcpServer()
     : running_(false),
-      listen_fd_(-1),
-      epoll_fd_(-1),
-      wake_fd_(-1),
-      next_connection_id_(1),
-      next_generation_(1)
-{}
+      accepting_(false) {}
 
 TcpServer::~TcpServer() { Stop(); }
 
+void TcpServer::SetOnOpen(OnOpenFn fn) { on_open_ = std::move(fn); }
 void TcpServer::SetOnFrame(OnFrameFn fn) { on_frame_ = std::move(fn); }
 void TcpServer::SetOnClose(OnCloseFn fn) { on_close_ = std::move(fn); }
+void TcpServer::SetOnBackpressure(OnBackpressureFn fn) { on_backpressure_ = std::move(fn); }
 void TcpServer::SetOptions(const TcpServerOptions& opts) { options_ = opts; }
-
 Status TcpServer::Start(const Endpoint& endpoint) {
     if (running_.load(std::memory_order_acquire)) {
         return Status::Ok();
@@ -54,6 +50,7 @@ Status TcpServer::Start(const Endpoint& endpoint) {
         Stop();
         return status;
     }
+    accepting_.store(true, std::memory_order_release);
     running_.store(true, std::memory_order_release);
     reactor_thread_ = std::thread([this] { RunEventLoop(); });
     return Status::Ok();
@@ -61,15 +58,13 @@ Status TcpServer::Start(const Endpoint& endpoint) {
 
 void TcpServer::Stop() {
     running_.store(false, std::memory_order_release);
+    accepting_.store(false, std::memory_order_release);
 
-    if (wake_fd_ != -1) {
-        const uint64_t value = 1;
-        (void)::write(wake_fd_, &value, sizeof(value));
-    }
+    WakeEventLoop();
     if (reactor_thread_.joinable()) {
         reactor_thread_.join();
     }
-    CloseFd(&listen_fd_);
+    CloseListenFd();
 
     std::vector<ConnectionId> ids;
     ids.reserve(connections_.size());
@@ -87,6 +82,11 @@ bool TcpServer::running() const {
     return running_.load(std::memory_order_acquire);
 }
 
+void TcpServer::StopAccepting() {
+    accepting_.store(false, std::memory_order_release);
+    WakeEventLoop();
+}
+
 Status TcpServer::SendFrame(ConnectionId conn_id,
                             uint64_t generation,
                             const ProtocolFrame& frame,
@@ -94,7 +94,7 @@ Status TcpServer::SendFrame(ConnectionId conn_id,
     if (!running_.load(std::memory_order_acquire)) {
         return Status::Error(StatusCode::kNetworkError, "TcpServer is stopped");
     }
-    const std::string data = codec_.Encode(frame);
+    std::string data = codec_.Encode(frame);
     bool overflow = false;
     {
         std::lock_guard<std::mutex> lock(response_mutex_);
@@ -102,7 +102,7 @@ Status TcpServer::SendFrame(ConnectionId conn_id,
             close_queue_.push_back({conn_id, generation});
             overflow = true;
         } else {
-            response_queue_.push_back({conn_id, generation, data, close_after_send});
+            response_queue_.push_back({conn_id, generation, std::move(data), close_after_send});
         }
     }
     WakeEventLoop();
@@ -172,6 +172,9 @@ Status TcpServer::SetupListener() {
 void TcpServer::RunEventLoop() {
     epoll_event events[kMaxEvents];
     while (running_.load(std::memory_order_acquire)) {
+        if (!accepting_.load(std::memory_order_acquire)) {
+            CloseListenFd();
+        }
         const int ready = ::epoll_wait(epoll_fd_, events, kMaxEvents, 1000);
         if (ready == -1) {
             if (errno == EINTR) continue;
@@ -179,8 +182,13 @@ void TcpServer::RunEventLoop() {
         }
         for (int i = 0; i < ready; ++i) {
             const int fd = events[i].data.fd;
-            if (fd == listen_fd_) { AcceptConnections(); continue; }
-            if (fd == wake_fd_)   { DrainWakeEvents(); DrainResponses(); continue; }
+            if (fd == listen_fd_) {
+                if (accepting_.load(std::memory_order_acquire)) {
+                    AcceptConnections();
+                }
+                continue;
+            }
+            if (fd == wake_fd_)   { DrainWakeEvents(); continue; }
             if ((events[i].events & EPOLLIN)  != 0) HandleClientRead(fd);
             if ((events[i].events & EPOLLOUT) != 0) FlushWriteBuffer(fd);
             if ((events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0) {
@@ -189,14 +197,16 @@ void TcpServer::RunEventLoop() {
         }
         DrainResponses();
     }
+    DrainResponses();
 }
 
 void TcpServer::AcceptConnections() {
+    if (listen_fd_ == -1 || !accepting_.load(std::memory_order_acquire)) {
+        return;
+    }
     while (true) {
-        sockaddr_in client_addr{};
-        socklen_t len = sizeof(client_addr);
-        const int client_fd = ::accept4(listen_fd_, reinterpret_cast<sockaddr*>(&client_addr),
-                                        &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        const int client_fd = ::accept4(
+            listen_fd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (client_fd == -1) return;
 
         epoll_event event{};
@@ -214,12 +224,22 @@ void TcpServer::AcceptConnections() {
         conn.generation = gen;
         connection_by_fd_[client_fd] = id;
         connections_[id] = std::move(conn);
+        if (on_open_) on_open_(id, gen);
+    }
+}
+
+void TcpServer::CloseListenFd() {
+    if (listen_fd_ != -1) {
+        if (epoll_fd_ != -1) {
+            (void)::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, listen_fd_, nullptr);
+        }
+        CloseFd(&listen_fd_);
     }
 }
 
 void TcpServer::HandleClientRead(int client_fd) {
     Connection* conn = FindByFd(client_fd);
-    if (conn == nullptr || conn->closing) return;
+    if (conn == nullptr || conn->closing || conn->in_backpressure) return;
 
     char temp[kReadChunkSize];
     while (true) {
@@ -261,16 +281,16 @@ void TcpServer::DrainResponses() {
         std::lock_guard<std::mutex> lock(response_mutex_);
         pending.swap(response_queue_);
     }
-    for (const auto& r : pending) {
+    for (auto& r : pending) {
         Connection* conn = FindById(r.conn_id);
-        if (conn == nullptr || !MatchesGeneration(r.conn_id, r.generation)) continue;
-        if (!SendToConnection(*conn, r.data)) {
+        if (conn == nullptr || (r.generation != 0 && conn->generation != r.generation)) continue;
+        if (!SendToConnection(*conn, std::move(r.data))) {
             CloseById(r.conn_id);
             continue;
         }
         if (r.close_after_send) {
-            if (conn->write_buffer.empty()) CloseById(r.conn_id);
-            else                            conn->closing = true;
+            if (!HasPendingWrites(*conn)) CloseById(r.conn_id);
+            else                          conn->closing = true;
         }
     }
     DrainCloseRequests();
@@ -326,45 +346,122 @@ bool TcpServer::MatchesGeneration(ConnectionId id, uint64_t generation) const {
     return generation == 0 || it->second.generation == generation;
 }
 
-bool TcpServer::SendToConnection(Connection& conn, const std::string& data) {
-    if (!conn.write_buffer.empty()) {
-        conn.write_buffer += data;
-        return conn.write_buffer.size() <= options_.max_write_buffer_bytes;
+bool TcpServer::HasPendingWrites(const Connection& conn) const {
+    return conn.write_buffer_bytes > 0;
+}
+
+void TcpServer::QueueWriteBuffer(Connection& conn, std::string&& data, std::size_t offset) {
+    if (offset >= data.size()) {
+        return;
+    }
+    const bool was_empty = conn.write_buffers.empty();
+    conn.write_buffer_bytes += data.size() - offset;
+    conn.write_buffers.push_back(std::move(data));
+    if (was_empty) {
+        conn.write_buffer_offset = offset;
+    }
+}
+
+bool TcpServer::SendToConnection(Connection& conn, std::string&& data) {
+    if (data.empty()) {
+        return true;
+    }
+    if (HasPendingWrites(conn)) {
+        QueueWriteBuffer(conn, std::move(data), 0);
+        if (!UpdateInterest(conn, true)) return false;
+        if (!MaybeEnterBackpressure(conn)) return false;
+        return conn.write_buffer_bytes <= options_.max_write_buffer_bytes;
     }
     const SendResult sent = SendAll(conn.fd, data.data(), data.size());
     if (sent.status == SendStatus::kOk)      return true;
     if (sent.status == SendStatus::kIoError) return false;
-    conn.write_buffer = data.substr(sent.sent);
-    if (conn.write_buffer.size() > options_.max_write_buffer_bytes) return false;
-    return SetWriteMode(conn.fd, true);
+    QueueWriteBuffer(conn, std::move(data), sent.sent);
+    if (conn.write_buffer_bytes > options_.max_write_buffer_bytes) return false;
+    if (!UpdateInterest(conn, true)) return false;
+    if (!MaybeEnterBackpressure(conn)) return false;
+    return true;
 }
 
 void TcpServer::FlushWriteBuffer(int client_fd) {
     Connection* conn = FindByFd(client_fd);
-    if (conn == nullptr || conn->write_buffer.empty()) return;
-    const SendResult sent = SendAll(client_fd, conn->write_buffer.data(), conn->write_buffer.size());
-    if (sent.status == SendStatus::kWouldBlock) {
-        conn->write_buffer.erase(0, sent.sent);
-        return;
+    if (conn == nullptr || !HasPendingWrites(*conn)) return;
+
+    while (HasPendingWrites(*conn)) {
+        std::string& front = conn->write_buffers.front();
+        const std::size_t offset = conn->write_buffer_offset;
+        const std::size_t remaining = front.size() - offset;
+        const SendResult sent = SendAll(client_fd, front.data() + offset, remaining);
+        conn = FindByFd(client_fd);
+        if (conn == nullptr) return;
+        if (sent.status == SendStatus::kIoError) {
+            CloseById(conn->id);
+            return;
+        }
+
+        conn->write_buffer_bytes -= sent.sent;
+        if (sent.status == SendStatus::kWouldBlock) {
+            conn->write_buffer_offset += sent.sent;
+            if (!MaybeLeaveBackpressure(*conn)) return;
+            return;
+        }
+
+        conn->write_buffers.pop_front();
+        conn->write_buffer_offset = 0;
     }
-    if (sent.status == SendStatus::kIoError) {
-        CloseById(conn->id);
-        return;
-    }
-    conn->write_buffer.clear();
-    if (!SetWriteMode(client_fd, false)) {
+
+    if (!MaybeLeaveBackpressure(*conn)) return;
+    if (!UpdateInterest(*conn, false)) {
         CloseById(conn->id);
         return;
     }
     if (conn->closing) CloseById(conn->id);
 }
 
-bool TcpServer::SetWriteMode(int client_fd, bool enable) {
+bool TcpServer::UpdateInterest(Connection& conn, bool want_write) {
     epoll_event event{};
-    event.data.fd = client_fd;
-    event.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
-    if (enable) event.events |= EPOLLOUT;
-    return ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, client_fd, &event) != -1;
+    event.data.fd = conn.fd;
+    event.events = EPOLLRDHUP | EPOLLET;
+    if (!conn.in_backpressure) event.events |= EPOLLIN;
+    if (want_write || HasPendingWrites(conn)) event.events |= EPOLLOUT;
+    return ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, conn.fd, &event) != -1;
+}
+
+bool TcpServer::SetBackpressure(Connection& conn, bool enabled) {
+    if (conn.in_backpressure == enabled) {
+        return true;
+    }
+    conn.in_backpressure = enabled;
+
+    std::ostringstream message;
+    message << (enabled ? "enter backpressure" : "leave backpressure")
+            << " fd=" << conn.fd
+            << " write_buffer_size=" << conn.write_buffer_bytes;
+    Logger::Log(LogLevel::kWarn, message.str());
+
+    if (on_backpressure_) {
+        on_backpressure_(conn.id, conn.generation, conn.fd, enabled, conn.write_buffer_bytes);
+    }
+    return UpdateInterest(conn, HasPendingWrites(conn));
+}
+
+bool TcpServer::MaybeEnterBackpressure(Connection& conn) {
+    if (!conn.in_backpressure && conn.write_buffer_bytes >= options_.high_watermark_bytes) {
+        if (!SetBackpressure(conn, true)) {
+            CloseById(conn.id);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool TcpServer::MaybeLeaveBackpressure(Connection& conn) {
+    if (conn.in_backpressure && conn.write_buffer_bytes <= options_.low_watermark_bytes) {
+        if (!SetBackpressure(conn, false)) {
+            CloseById(conn.id);
+            return false;
+        }
+    }
+    return true;
 }
 
 void TcpServer::CloseByFd(int client_fd) {
@@ -382,6 +479,16 @@ void TcpServer::CloseById(ConnectionId conn_id) {
     if (it == connections_.end()) return;
     const int client_fd = it->second.fd;
     const uint64_t gen = it->second.generation;
+    if (it->second.in_backpressure) {
+        std::ostringstream message;
+        message << "leave backpressure"
+                << " fd=" << client_fd
+                << " write_buffer_size=" << it->second.write_buffer_bytes;
+        Logger::Log(LogLevel::kWarn, message.str());
+        if (on_backpressure_) {
+            on_backpressure_(conn_id, gen, client_fd, false, it->second.write_buffer_bytes);
+        }
+    }
     connection_by_fd_.erase(client_fd);
     connections_.erase(it);
     ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, client_fd, nullptr);

@@ -36,6 +36,7 @@ auto response = client.Call("UserService", "GetUser", request, 3000);
 - 心跳检测
 - 简单服务发现
 - 负载均衡
+- 用户态协程调度器
 - JSON / Protobuf 序列化抽象
 - 指标统计和压测
 
@@ -281,6 +282,15 @@ IO 线程收到完整请求
 - 连接关闭后，未发送响应不能继续访问已释放连接。
 - 服务端要限制最大连接数和最大请求包大小。
 
+协程演进路线：
+
+1. 先在 `runtime` 层实现独立的用户态 `Coroutine`，只验证 `Resume/Yield` 和栈切换。
+2. 再增加 `Scheduler`、`TimerQueue` 和 fd 等待队列。
+3. 最后把非阻塞 socket 的 `EAGAIN` 挂起和 epoll 事件恢复串起来，形成显式的 `CoRead/CoWrite`。
+4. 协程网络路径成熟前，现有 reactor + `ThreadPool` 路径保持可用。
+
+协程设计细节见 `docs/coroutine.md`。
+
 ## 9. 序列化层
 
 框架不应该和某一种序列化格式强绑定。
@@ -389,6 +399,49 @@ service_name
 - pending 请求数
 - 平均延迟
 - P95 / P99 延迟，可选
+
+可观测性的目标是支持性能分析闭环，而不是只把数字打印出来。压测时至少要能回答：
+
+- 低并发下 reactor 路径和协程路径的额外调度成本是否可见。
+- 高并发下瓶颈来自连接管理、协议编解码、业务线程池还是写回队列。
+- handler 变慢时 IO 线程是否仍能 accept/read/write。
+- 线程池队列满时拒绝了多少请求，是否出现 pending 请求无限增长。
+
+推荐把压测报告固定为 Reactor + ThreadPool 与 Coroutine + epoll + ThreadPool 两条路径对比，记录 QPS、P50/P95/P99、CPU、失败数和关键服务端指标。报告模板见 `docs/performance.md`。
+
+## 12.1 背压、deadline 与优雅关闭
+
+这三项比横向扩展 HTTP、TLS 或复杂注册中心更贴近 RPC 框架主线。
+
+背压：
+
+- `ThreadPool::Post()` 队列满必须被调用方处理。
+- 第一版可以返回 `kServerError` 或关闭连接，后续可追加 `kOverloaded` 状态码。
+- metrics 记录 `rejected_requests`，压测报告区分 accepted QPS 和 offered QPS。
+
+deadline：
+
+- 客户端 timeout 已传播为请求 protobuf body 中的 `deadline_unix_ms`。
+- 服务端收到已过期请求直接返回 `kTimeout`，不进入业务 handler。
+- 后续可在 handler 执行前暴露剩余时间，避免已无意义的业务继续排队。
+
+优雅关闭：
+
+- `Stop(grace_period)` 后停止 accept 新连接。
+- 已收到请求允许在 grace period 内完成。
+- grace period 超时后关闭连接。
+- pending 请求通过连接关闭或客户端超时明确失败，避免无限等待。
+
+暂不优先投入：
+
+- HTTP server
+- TLS
+- etcd / ZooKeeper 注册中心
+- 复杂 XML 配置
+- syscall hook
+- 分布式 tracing
+
+当前主线保持为：RPC 协议 + epoll + 协程 + ThreadPool + timeout + 测试 + 压测分析。
 
 ## 13. 测试策略
 
@@ -617,7 +670,7 @@ miniRPC/
 - 客户端请求能轮询分配到不同节点。
 - 某个节点失败时不会永久阻塞整体调用。
 
-### Milestone 8：测试与压测
+### Milestone 8：测试、指标与压测
 
 目标：让框架具有可信度。
 
@@ -627,13 +680,55 @@ miniRPC/
 - 集成测试
 - 异常测试
 - 简单 benchmark
-- QPS 和延迟输出
+- QPS、P50/P95/P99 和失败数输出
+- active/pending/rejected 请求指标
+- ThreadPool 队列长度指标
+- Reactor 与 Coroutine 路径对比报告
 
 验收标准：
 
 - 核心模块测试通过。
-- Echo 压测可以输出 QPS、平均延迟和失败数。
+- Echo 压测可以输出 QPS、平均延迟、P99 和失败数。
+- 慢 handler 场景可以证明 IO 线程没有被业务阻塞。
+- 线程池队列满时能返回明确错误并统计 rejected 请求。
 - 长时间运行没有明显内存增长或 pending 请求泄漏。
+
+### Milestone 9：用户态协程运行时
+
+目标：让 runtime 层具备用户态协程切换和调度能力，为后续 epoll 协程化 IO 做准备。
+
+必须完成：
+
+- `Coroutine`
+- x86-64 上下文切换汇编
+- `Scheduler`
+- `TimerQueue`
+- `CoRead/CoWrite`
+- socketpair 或本地 TCP 协程 IO 测试
+
+验收标准：
+
+- 多个协程可以按预期 `Resume/Yield`。
+- `CoRead/CoWrite` 遇到 `EAGAIN` 不阻塞线程。
+- epoll 事件可以恢复等待中的协程。
+
+### Milestone 10：协程化连接处理
+
+目标：服务端连接读写可以用同步风格代码运行在异步 IO 之上。
+
+必须完成：
+
+- connection coroutine loop
+- RPC frame 读取和写回协程化
+- 连接关闭时恢复或失败等待中的协程
+- 与现有 `ThreadPool` handler 分发保持兼容
+- 集成测试和压测对比
+
+验收标准：
+
+- Echo RPC 可以走协程连接路径。
+- 慢 handler 不阻塞 IO 线程。
+- 连接关闭、协议错误、超时请求都能明确失败。
 
 ## 16. 推荐开发顺序
 

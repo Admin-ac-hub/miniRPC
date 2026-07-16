@@ -44,7 +44,6 @@ Status TcpClient::Connect(const Endpoint& endpoint) {
     if (reader_thread_.joinable() && reader_thread_.get_id() != std::this_thread::get_id()) {
         reader_thread_.join();
     }
-    endpoint_ = endpoint;
 
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd == -1) {
