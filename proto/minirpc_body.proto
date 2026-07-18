@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package minirpc;
+
+// RPC 请求帧 body。request_id 不在此处，已在外层 20 字节帧头中。
+message PbRequestBody {
+  string service_name = 1;
+  string method_name  = 2;
+  bytes  payload      = 3;
+  int64  deadline_unix_ms = 4;
+}
+
+// RPC 响应帧 body。request_id 不在此处。
+message PbResponseBody {
+  int32  status_code   = 1;
+  string error_message = 2;
+  bytes  payload       = 3;
+}

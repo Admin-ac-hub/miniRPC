@@ -7,6 +7,7 @@ cmake-build-*/
 *.dSYM/
 .DS_Store
 .idea/
+.VSCodeCounter/
 .cache/
 .claude/
 compile_commands.json
