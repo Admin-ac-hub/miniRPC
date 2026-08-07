@@ -441,7 +441,7 @@ deadline：
 - syscall hook
 - 分布式 tracing
 
-当前主线保持为：RPC 协议 + epoll + 协程 + ThreadPool + timeout + 测试 + 压测分析。
+当前主线保持为：RPC 协议 + 可选 epoll/io_uring Reactor + epoll 协程路径 + ThreadPool + timeout + 测试 + 压测分析。Reactor 默认仍为 epoll；io_uring 通过 CMake 显式启用，不做运行时静默回退。现有 A/B 显示 io_uring 并非所有负载都更快，切换默认值必须等 64 KiB 吞吐和高连接尾延迟完成 profiling 后另行决定。
 
 ## 13. 测试策略
 

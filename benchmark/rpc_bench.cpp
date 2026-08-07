@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <sys/resource.h>
+#include <sys/utsname.h>
 
 #include "minirpc/client/rpc_client.h"
 #include "minirpc/core/status.h"
@@ -24,6 +25,18 @@
 #include "minirpc/server/rpc_server.h"
 
 namespace {
+
+#ifndef MINIRPC_GIT_REVISION
+#define MINIRPC_GIT_REVISION "unknown"
+#endif
+
+#ifndef MINIRPC_LIBURING_VERSION
+#define MINIRPC_LIBURING_VERSION "unknown"
+#endif
+
+#ifndef MINIRPC_TCP_SERVER_BACKEND_NAME
+#define MINIRPC_TCP_SERVER_BACKEND_NAME "unknown"
+#endif
 
 struct Options {
     std::string host = "127.0.0.1";
@@ -194,6 +207,21 @@ CpuUsage ReadCpuUsage() {
     result.system_seconds =
         static_cast<double>(usage.ru_stime.tv_sec) + static_cast<double>(usage.ru_stime.tv_usec) / 1000000.0;
     return result;
+}
+
+std::string KernelVersion() {
+    utsname info{};
+    return ::uname(&info) == 0 ? info.release : "unknown";
+}
+
+const char* CompilerVersion() {
+#if defined(__clang__)
+    return __clang_version__;
+#elif defined(__GNUC__)
+    return __VERSION__;
+#else
+    return "unknown";
+#endif
 }
 
 CpuUsage DeltaCpu(CpuUsage after, CpuUsage before) {
@@ -504,6 +532,13 @@ int main(int argc, char** argv) {
     if (payload_sizes.empty()) {
         payload_sizes.push_back(options.payload_size);
     }
+
+    std::cout << "commit=" << MINIRPC_GIT_REVISION
+              << " kernel=" << KernelVersion()
+              << " compiler=\"" << CompilerVersion() << '"'
+              << " tcp_backend=" << MINIRPC_TCP_SERVER_BACKEND_NAME
+              << " coroutine_io_backend=epoll"
+              << " liburing=" << MINIRPC_LIBURING_VERSION << '\n';
 
     for (std::size_t payload_size : payload_sizes) {
         Options run_options = options;

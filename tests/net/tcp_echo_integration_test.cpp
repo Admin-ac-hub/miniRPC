@@ -8,6 +8,11 @@
 #include <utility>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
 #include "minirpc/net/tcp_client.h"
 #include "minirpc/net/tcp_server.h"
 #include "minirpc/protocol/codec.h"
@@ -24,6 +29,59 @@ bool WaitUntil(const std::function<bool()>& predicate, std::chrono::milliseconds
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     return predicate();
+}
+
+int ConnectRaw(uint16_t port) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd != -1);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    const int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    assert(rc == 0);
+    return fd;
+}
+
+void SendAllRaw(int fd, const std::string& data) {
+    std::size_t sent = 0;
+    while (sent < data.size()) {
+        const ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
+        assert(n > 0);
+        sent += static_cast<std::size_t>(n);
+    }
+}
+
+void SetRecvTimeout(int fd, int milliseconds) {
+    timeval timeout{};
+    timeout.tv_sec = milliseconds / 1000;
+    timeout.tv_usec = (milliseconds % 1000) * 1000;
+    const int rc = ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    assert(rc == 0);
+}
+
+std::vector<minirpc::ProtocolFrame> ReceiveFramesRaw(int fd, std::size_t frame_count) {
+    minirpc::RpcCodec codec;
+    std::string buffer;
+    std::vector<minirpc::ProtocolFrame> frames;
+    frames.reserve(frame_count);
+
+    while (frames.size() < frame_count) {
+        minirpc::ProtocolFrame frame;
+        std::string error;
+        const minirpc::DecodeResult result = codec.TryDecode(buffer, &frame, &error);
+        assert(result != minirpc::DecodeResult::kProtocolError);
+        if (result == minirpc::DecodeResult::kSuccess) {
+            frames.push_back(std::move(frame));
+            continue;
+        }
+
+        char chunk[4096];
+        const ssize_t n = ::recv(fd, chunk, sizeof(chunk), 0);
+        assert(n > 0);
+        buffer.append(chunk, static_cast<std::size_t>(n));
+    }
+    return frames;
 }
 
 void TestSingleEcho() {
@@ -250,6 +308,49 @@ void TestSmallPacketHighFrequencyEchoPreservesOrder() {
     server.Stop();
 }
 
+void TestHalfPacketFollowedByStickyPacketsPreservesOrder() {
+    minirpc::TcpServer server;
+    std::atomic<int> frame_count{0};
+    server.SetOnFrame([&](minirpc::ConnectionId id,
+                          uint64_t generation,
+                          minirpc::ProtocolFrame frame) {
+        frame_count.fetch_add(1);
+        frame.message_type = minirpc::MessageType::kResponse;
+        assert(server.SendFrame(id, generation, frame, false).ok());
+    });
+    assert(server.Start({"127.0.0.1", 19406}).ok());
+
+    minirpc::ProtocolFrame first;
+    first.request_id = 601;
+    first.message_type = minirpc::MessageType::kRequest;
+    first.body = "first-frame-arrives-in-two-parts";
+
+    minirpc::ProtocolFrame second;
+    second.request_id = 602;
+    second.message_type = minirpc::MessageType::kRequest;
+    second.body = "second-frame-is-sticky";
+
+    minirpc::RpcCodec codec;
+    const std::string first_wire = codec.Encode(first);
+    const std::string second_wire = codec.Encode(second);
+    const std::size_t split = minirpc::kProtocolHeaderSize + first.body.size() / 2;
+
+    int fd = ConnectRaw(19406);
+    SetRecvTimeout(fd, 2000);
+    SendAllRaw(fd, first_wire.substr(0, split));
+    SendAllRaw(fd, first_wire.substr(split) + second_wire);
+
+    const std::vector<minirpc::ProtocolFrame> responses = ReceiveFramesRaw(fd, 2);
+    assert(responses[0].request_id == first.request_id);
+    assert(responses[0].body == first.body);
+    assert(responses[1].request_id == second.request_id);
+    assert(responses[1].body == second.body);
+    assert(frame_count.load() == 2);
+
+    ::close(fd);
+    server.Stop();
+}
+
 }  // namespace
 
 int main() {
@@ -259,5 +360,6 @@ int main() {
     TestServerObservesClientClose();
     TestLargePayloadBurstPreservesOrder();
     TestSmallPacketHighFrequencyEchoPreservesOrder();
+    TestHalfPacketFollowedByStickyPacketsPreservesOrder();
     return 0;
 }

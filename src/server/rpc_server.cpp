@@ -2,9 +2,9 @@
 
 #include <chrono>
 #include <exception>
-#include <thread>
 #include <utility>
 
+#include "minirpc/net/tcp_server_backend.h"
 #include "minirpc/protocol/body_codec.h"
 
 namespace minirpc {
@@ -28,6 +28,14 @@ bool DeadlineExpired(const RpcRequest& request) {
     return now_ms >= request.deadline_unix_ms;
 }
 
+RpcResponse MakeErrorResponse(uint64_t request_id, StatusCode code, const std::string& message) {
+    RpcResponse response;
+    response.request_id = request_id;
+    response.status_code = static_cast<int32_t>(code);
+    response.error_message = message;
+    return response;
+}
+
 ProtocolFrame MakeResponseFrame(uint64_t request_id, const RpcResponse& response) {
     ProtocolFrame frame;
     frame.request_id = request_id;
@@ -37,12 +45,34 @@ ProtocolFrame MakeResponseFrame(uint64_t request_id, const RpcResponse& response
     return frame;
 }
 
-RpcResponse MakeErrorResponse(uint64_t request_id, StatusCode code, const std::string& message) {
-    RpcResponse response;
-    response.request_id = request_id;
-    response.status_code = static_cast<int32_t>(code);
-    response.error_message = message;
-    return response;
+Status EncodeResponseFrame(uint64_t request_id,
+                           const RpcResponse& response,
+                           ProtocolFrame* frame) {
+    try {
+        ProtocolFrame encoded = MakeResponseFrame(request_id, response);
+        if (encoded.body.size() > kDefaultMaxFrameBodySize) {
+            return Status::Error(StatusCode::kSerializeError, "response body too large");
+        }
+        *frame = std::move(encoded);
+        return Status::Ok();
+    } catch (const BodyCodecError& ex) {
+        return Status::Error(StatusCode::kSerializeError, ex.what());
+    } catch (const std::exception& ex) {
+        return Status::Error(StatusCode::kSerializeError, ex.what());
+    } catch (...) {
+        return Status::Error(StatusCode::kSerializeError, "failed to serialize response body");
+    }
+}
+
+Status PrepareResponseFrame(uint64_t request_id,
+                            RpcResponse* response,
+                            ProtocolFrame* frame) {
+    Status status = EncodeResponseFrame(request_id, *response, frame);
+    if (status.ok()) {
+        return status;
+    }
+    *response = MakeErrorResponse(request_id, StatusCode::kSerializeError, status.message());
+    return EncodeResponseFrame(request_id, *response, frame);
 }
 
 }  // namespace
@@ -93,10 +123,14 @@ Status RpcServer::Start(const Endpoint& endpoint) {
         metrics_.SetServerState(static_cast<uint64_t>(ShutdownState::kStopped));
         return status;
     }
-    shutdown_state_.store(ShutdownState::kRunning, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(drain_mutex_);
+        shutdown_state_.store(ShutdownState::kRunning, std::memory_order_release);
+        running_.store(true, std::memory_order_release);
+        response_drain_sealed_ = false;
+    }
     metrics_.SetServerState(static_cast<uint64_t>(ShutdownState::kRunning));
     metrics_.SetShutdownStartTimeMs(0);
-    running_.store(true, std::memory_order_release);
     return Status::Ok();
 }
 
@@ -105,27 +139,35 @@ void RpcServer::Stop() {
 }
 
 void RpcServer::Stop(std::chrono::milliseconds grace_period) {
-    ShutdownState expected = ShutdownState::kRunning;
-    if (!shutdown_state_.compare_exchange_strong(expected,
-                                                 ShutdownState::kDraining,
-                                                 std::memory_order_acq_rel,
-                                                 std::memory_order_acquire)) {
-        while (shutdown_state_.load(std::memory_order_acquire) == ShutdownState::kDraining) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    {
+        std::unique_lock<std::mutex> lock(drain_mutex_);
+        ShutdownState expected = ShutdownState::kRunning;
+        if (!shutdown_state_.compare_exchange_strong(expected,
+                                                     ShutdownState::kDraining,
+                                                     std::memory_order_acq_rel,
+                                                     std::memory_order_acquire)) {
+            drain_cv_.wait(lock, [this] {
+                return shutdown_state_.load(std::memory_order_acquire) !=
+                       ShutdownState::kDraining;
+            });
+            return;
         }
-        return;
+        running_.store(false, std::memory_order_release);
     }
     metrics_.SetServerState(static_cast<uint64_t>(ShutdownState::kDraining));
     metrics_.SetShutdownStartTimeMs(UnixTimeMs());
-    running_.store(false, std::memory_order_release);
     tcp_server_.StopAccepting();
     if (!WaitForPendingRequests(grace_period)) {
         metrics_.RecordGracefulShutdownTimeout();
     }
     tcp_server_.Stop();
     thread_pool_.Stop();
-    shutdown_state_.store(ShutdownState::kStopped, std::memory_order_release);
-    metrics_.SetServerState(static_cast<uint64_t>(ShutdownState::kStopped));
+    {
+        std::lock_guard<std::mutex> lock(drain_mutex_);
+        metrics_.SetServerState(static_cast<uint64_t>(ShutdownState::kStopped));
+        shutdown_state_.store(ShutdownState::kStopped, std::memory_order_release);
+        drain_cv_.notify_all();
+    }
 }
 
 bool RpcServer::running() const {
@@ -156,36 +198,88 @@ void RpcServer::OnFrame(ConnectionId conn_id, uint64_t generation, ProtocolFrame
 
     const auto start_time = std::chrono::steady_clock::now();
     const uint64_t request_id = frame.request_id;
-    if (shutdown_state_.load(std::memory_order_acquire) != ShutdownState::kRunning) {
-        metrics_.RecordRequest();
+    metrics_.RecordRequest();
+    bool admitted = false;
+    bool track_rejection = false;
+    {
+        std::lock_guard<std::mutex> lock(drain_mutex_);
+        const ShutdownState state = shutdown_state_.load(std::memory_order_acquire);
+        if (state == ShutdownState::kRunning) {
+            metrics_.IncrementPendingRequests();
+            admitted = true;
+        } else if (state == ShutdownState::kDraining && !response_drain_sealed_) {
+            metrics_.IncrementPendingRequests();
+            track_rejection = true;
+        }
+    }
+    if (!admitted) {
+        if (!track_rejection) {
+            tcp_server_.CloseConnection(conn_id, generation);
+            metrics_.RecordRejected();
+            metrics_.RecordLatency(std::chrono::steady_clock::now() - start_time);
+            return;
+        }
+
         RpcResponse response = MakeErrorResponse(
             request_id, StatusCode::kServerError, "server shutting down");
-        const Status send_status = tcp_server_.SendFrame(
-            conn_id, generation, MakeResponseFrame(request_id, response), false);
-        if (send_status.ok()) {
-            metrics_.RecordResponse();
-        }
+        const auto finish_rejection = [this, start_time](Status send_status) {
+            if (send_status.ok()) {
+                metrics_.RecordResponse();
+            }
+            metrics_.RecordLatency(std::chrono::steady_clock::now() - start_time);
+            CompletePendingRequest();
+        };
+        ProtocolFrame response_frame;
+        const Status encode_status = PrepareResponseFrame(request_id, &response, &response_frame);
         metrics_.RecordRejected();
-        metrics_.RecordLatency(std::chrono::steady_clock::now() - start_time);
+        if (!encode_status.ok()) {
+            tcp_server_.CloseConnection(conn_id, generation);
+            finish_rejection(encode_status);
+            return;
+        }
+        const Status send_status = TcpServerInternalAccess::SendFrame(
+            tcp_server_,
+            conn_id,
+            generation,
+            response_frame,
+            false,
+            finish_rejection);
+        if (!send_status.ok()) {
+            finish_rejection(send_status);
+        }
         return;
     }
-
-    metrics_.RecordRequest();
-    metrics_.IncrementPendingRequests();
 
     if (!thread_pool_.Post([this, conn_id, generation, start_time, f = std::move(frame)]() mutable {
             ProcessRequest(conn_id, generation, std::move(f), start_time);
         })) {
         RpcResponse response = MakeErrorResponse(
             request_id, StatusCode::kServerError, "thread pool queue is full");
-        const Status send_status = tcp_server_.SendFrame(conn_id, generation,
-                                                         MakeResponseFrame(request_id, response), true);
-        if (send_status.ok()) {
-            metrics_.RecordResponse();
-        }
+        const auto finish_rejection = [this, start_time](Status send_status) {
+            if (send_status.ok()) {
+                metrics_.RecordResponse();
+            }
+            metrics_.RecordLatency(std::chrono::steady_clock::now() - start_time);
+            CompletePendingRequest();
+        };
+        ProtocolFrame response_frame;
+        const Status encode_status = PrepareResponseFrame(request_id, &response, &response_frame);
         metrics_.RecordRejected();
-        metrics_.RecordLatency(std::chrono::steady_clock::now() - start_time);
-        metrics_.DecrementPendingRequests();
+        if (!encode_status.ok()) {
+            tcp_server_.CloseConnection(conn_id, generation);
+            finish_rejection(encode_status);
+            return;
+        }
+        const Status send_status = TcpServerInternalAccess::SendFrame(
+            tcp_server_,
+            conn_id,
+            generation,
+            response_frame,
+            true,
+            finish_rejection);
+        if (!send_status.ok()) {
+            finish_rejection(send_status);
+        }
     }
 }
 
@@ -226,39 +320,67 @@ void RpcServer::ProcessRequest(ConnectionId conn_id,
     } catch (...) {
         response = MakeErrorResponse(frame.request_id, StatusCode::kServerError, "unknown server error");
     }
-    const Status send_status = tcp_server_.SendFrame(conn_id, generation,
-                                                     MakeResponseFrame(frame.request_id, response), false);
-    FinishRequestMetrics(response, send_status, start_time);
+    ProtocolFrame response_frame;
+    const Status encode_status = PrepareResponseFrame(frame.request_id, &response, &response_frame);
+    if (!encode_status.ok()) {
+        tcp_server_.CloseConnection(conn_id, generation);
+        FinishRequestMetrics(response.status_code, encode_status, start_time);
+        return;
+    }
+    const int32_t response_status_code = response.status_code;
+    const auto finish_request = [this, response_status_code, start_time](Status send_status) {
+        FinishRequestMetrics(response_status_code, send_status, start_time);
+    };
+    const Status send_status = TcpServerInternalAccess::SendFrame(
+        tcp_server_,
+        conn_id,
+        generation,
+        response_frame,
+        false,
+        finish_request);
+    if (!send_status.ok()) {
+        finish_request(send_status);
+    }
 }
 
-void RpcServer::FinishRequestMetrics(const RpcResponse& response,
+void RpcServer::FinishRequestMetrics(int32_t response_status_code,
                                      const Status& send_status,
                                      std::chrono::steady_clock::time_point start_time) {
     if (!send_status.ok()) {
         metrics_.RecordFailure();
     } else {
         metrics_.RecordResponse();
-        if (response.status_code == static_cast<int32_t>(StatusCode::kOk)) {
+        if (response_status_code == static_cast<int32_t>(StatusCode::kOk)) {
             metrics_.RecordSuccess();
-        } else if (response.status_code == static_cast<int32_t>(StatusCode::kTimeout)) {
+        } else if (response_status_code == static_cast<int32_t>(StatusCode::kTimeout)) {
             metrics_.RecordTimeout();
         } else {
             metrics_.RecordFailure();
         }
     }
     metrics_.RecordLatency(std::chrono::steady_clock::now() - start_time);
-    metrics_.DecrementPendingRequests();
+    CompletePendingRequest();
 }
 
-bool RpcServer::WaitForPendingRequests(std::chrono::milliseconds grace_period) const {
+void RpcServer::CompletePendingRequest() {
+    {
+        std::lock_guard<std::mutex> lock(drain_mutex_);
+        metrics_.DecrementPendingRequests();
+    }
+    drain_cv_.notify_all();
+}
+
+bool RpcServer::WaitForPendingRequests(std::chrono::milliseconds grace_period) {
+    std::unique_lock<std::mutex> lock(drain_mutex_);
+    const auto drained = [this] { return metrics_.pending_requests() == 0; };
+    bool all_requests_drained = false;
     if (grace_period <= std::chrono::milliseconds::zero()) {
-        return metrics_.pending_requests() == 0;
+        all_requests_drained = drained();
+    } else {
+        all_requests_drained = drain_cv_.wait_for(lock, grace_period, drained);
     }
-    const auto deadline = std::chrono::steady_clock::now() + grace_period;
-    while (metrics_.pending_requests() > 0 && std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    return metrics_.pending_requests() == 0;
+    response_drain_sealed_ = true;
+    return all_requests_drained;
 }
 
 }  // namespace minirpc

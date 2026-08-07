@@ -1,9 +1,11 @@
 #pragma once
 
 #include <atomic>
-#include <cstddef>
 #include <chrono>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 #include "minirpc/core/endpoint.h"
@@ -50,10 +52,11 @@ private:
                         uint64_t generation,
                         ProtocolFrame frame,
                         std::chrono::steady_clock::time_point start_time);
-    void FinishRequestMetrics(const RpcResponse& response,
+    void FinishRequestMetrics(int32_t response_status_code,
                               const Status& send_status,
                               std::chrono::steady_clock::time_point start_time);
-    bool WaitForPendingRequests(std::chrono::milliseconds grace_period) const;
+    void CompletePendingRequest();
+    bool WaitForPendingRequests(std::chrono::milliseconds grace_period);
 
     std::atomic<bool> running_;
     std::atomic<ShutdownState> shutdown_state_;
@@ -61,6 +64,9 @@ private:
     ThreadPool thread_pool_;
     TcpServer tcp_server_;
     RpcMetrics metrics_{};
+    std::mutex drain_mutex_;
+    std::condition_variable drain_cv_;
+    bool response_drain_sealed_ = true;
 };
 
 }  // namespace minirpc
