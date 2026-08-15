@@ -11,4 +11,7 @@ cmake-build-*/
 .VSCodeCounter/
 .cache/
 .claude/
+AGENTS.md
+CLAUDE.md
+docs/superpowers/
 compile_commands.json
