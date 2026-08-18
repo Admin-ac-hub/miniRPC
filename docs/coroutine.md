@@ -10,7 +10,7 @@ miniRPC 的协程能力放在 `runtime` 层，目标是把非阻塞 IO 封装成
 - epoll 事件到来后恢复等待该 fd 的协程。
 - 让连接处理代码可以逐步写成 `ReadFrame -> Dispatch -> WriteFrame` 的顺序流程。
 
-协程不替代协议层、序列化层、服务注册层，也不让业务 handler 直接跑在 reactor 线程里。耗时业务仍然必须经过 `ThreadPool` 或后续明确的业务调度器。
+协程不替代协议与 body codec、服务注册层，也不让业务 handler 直接跑在 reactor 线程里。耗时业务仍然必须经过 `ThreadPool` 或后续明确的业务调度器。
 
 ## 分阶段接入
 
@@ -113,7 +113,7 @@ CoroutineRpcConnection::Serve(fd)
   -> CoroutineFrameChannel::WriteFrame()
 ```
 
-这一层已经跑通单连接 RPC 闭环，并支持可选 `ThreadPool` 分发。跨线程恢复不直接修改 scheduler ready queue，而是写入 `CoroutineIoContext` 的 pending ready 队列并通过 `eventfd` 唤醒 epoll，IO 线程醒来后再统一调度协程。未传入 `ThreadPool` 时保留同步执行模式，主要用于小范围单元测试。
+这一层已经跑通单连接 RPC 闭环，并支持可选 `ThreadPool` 分发。跨线程恢复不直接修改 scheduler ready queue，而是写入 `CoroutineIoContext` 的 control queue 并通过 `eventfd` 唤醒 epoll，IO 线程醒来后再统一调度协程。未传入 `ThreadPool` 时保留同步执行模式，主要用于小范围单元测试。
 
 ### 7. 协程版服务端入口
 
@@ -148,6 +148,7 @@ accept coroutine
 - `TimerQueue::DrainExpired()`
 - `CoroutineIoContext::Run()`
 - `CoroutineIoContext::Schedule()`
+- `CoroutineIoContext::Post()`
 - `CoroutineIoContext::Read()`
 - `CoroutineIoContext::WriteAll()`
 - `CoroutineFrameChannel::ReadFrame()`
@@ -155,6 +156,10 @@ accept coroutine
 - `CoroutineRpcConnection::Serve()`
 - `CoroutineRpcServer::Start()`
 - `CoroutineRpcServer::Stop()`
-- x86-64 System V ABI 和 aarch64 ABI 下的寄存器保存与恢复
+- Stop 对 fd waiter 和 timer waiter 的主动取消
+- `CoroutineRpcServer` 的 Draining 准入封口和 Start -> Stop -> Start
+- x86-64 System V ABI 和 aarch64 ABI 下的基础通用寄存器保存与恢复
 
-后续可对比压测协程版服务端和现有 reactor 服务端，再决定是否让协程路径成为默认实现。
+当前活动范围和验收条件见
+[coroutine_runtime_minimal_plan.md](coroutine_runtime_minimal_plan.md)。协程服务端保持实验路径，
+不作为默认实现，也不继续扩展为通用协程框架。

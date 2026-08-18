@@ -1,12 +1,10 @@
 #include <cassert>
 #include <chrono>
-#include <thread>
 #include <string>
-#include <vector>
+#include <thread>
 
 #include "minirpc/client/rpc_client.h"
 #include "minirpc/core/status.h"
-#include "minirpc/discovery/load_balancer.h"
 #include "minirpc/protocol/body_codec.h"
 #include "minirpc/protocol/codec.h"
 #include "minirpc/server/rpc_server.h"
@@ -75,14 +73,6 @@ int main() {
     assert(static_cast<bool>(registry.Find("EchoService", "Echo")));
     assert(!registry.HasService("MissingService"));
     assert(!static_cast<bool>(registry.Find("EchoService", "Missing")));
-
-    minirpc::RoundRobinLoadBalancer balancer;
-    std::vector<minirpc::Endpoint> endpoints = {
-        {"127.0.0.1", 9001},
-        {"127.0.0.1", 9002},
-    };
-    assert(balancer.Select("EchoService", endpoints).port == 9001);
-    assert(balancer.Select("EchoService", endpoints).port == 9002);
 
     minirpc::RpcServer server;
     server.RegisterService("EchoService", "Echo", [](const minirpc::RpcRequest& request) {

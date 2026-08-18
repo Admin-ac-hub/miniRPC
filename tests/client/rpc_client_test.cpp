@@ -108,8 +108,8 @@ minirpc::ProtocolFrame ReceiveFrameRaw(int fd) {
     }
 }
 
-minirpc::RpcResponse SendRawRequest(const minirpc::Endpoint& endpoint,
-                                    const minirpc::RpcRequest& request) {
+minirpc::RpcResponse SendFrameRequest(const minirpc::Endpoint& endpoint,
+                                      const minirpc::ProtocolFrame& request_frame) {
     std::promise<minirpc::RpcResponse> promise;
     auto future = promise.get_future();
     std::atomic<bool> done{false};
@@ -118,19 +118,24 @@ minirpc::RpcResponse SendRawRequest(const minirpc::Endpoint& endpoint,
         if (done.exchange(true)) {
             return;
         }
+        assert(frame.codec_type == minirpc::CodecType::kProtobuf);
         promise.set_value(minirpc::DecodeResponseBody(frame.request_id, frame.body));
     });
     assert(client.Connect(endpoint).ok());
+    assert(client.SendFrame(request_frame).ok());
+    assert(future.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    client.Close();
+    return future.get();
+}
 
+minirpc::RpcResponse SendRawRequest(const minirpc::Endpoint& endpoint,
+                                    const minirpc::RpcRequest& request) {
     minirpc::ProtocolFrame frame;
     frame.request_id = request.request_id;
     frame.message_type = minirpc::MessageType::kRequest;
     frame.codec_type = minirpc::CodecType::kProtobuf;
     frame.body = minirpc::EncodeRequestBody(request);
-    assert(client.SendFrame(frame).ok());
-    assert(future.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
-    client.Close();
-    return future.get();
+    return SendFrameRequest(endpoint, frame);
 }
 
 minirpc::RpcResponse EchoHandler(const minirpc::RpcRequest& req) {
@@ -144,6 +149,12 @@ minirpc::RpcResponse EchoHandler(const minirpc::RpcRequest& req) {
 minirpc::RpcResponse SlowHandler(const minirpc::RpcRequest& req) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     return EchoHandler(req);
+}
+
+void TestImmediateDestructionStopsTimeoutCleaner() {
+    for (int i = 0; i < 1000; ++i) {
+        minirpc::RpcClient client({"127.0.0.1", 19999});
+    }
 }
 
 void TestBasicEcho() {
@@ -384,6 +395,35 @@ void TestServerMetricsFailures() {
     assert(server.metrics().pending_requests() == 0);
 
     client.Close();
+    server.Stop();
+}
+
+void TestServerRejectsUnsupportedRpcCodec() {
+    minirpc::RpcServer server;
+    std::atomic<int> invoked{0};
+    server.RegisterService("EchoService", "Echo", [&](const minirpc::RpcRequest& req) {
+        invoked.fetch_add(1);
+        return EchoHandler(req);
+    });
+    assert(server.Start({"127.0.0.1", 19515}).ok());
+
+    minirpc::ProtocolFrame frame;
+    frame.request_id = 701;
+    frame.message_type = minirpc::MessageType::kRequest;
+    frame.codec_type = minirpc::CodecType::kRaw;
+    frame.body = "raw body is not an RPC body codec";
+    const minirpc::RpcResponse response =
+        SendFrameRequest({"127.0.0.1", 19515}, frame);
+
+    assert(response.request_id == frame.request_id);
+    assert(response.status_code ==
+           static_cast<int32_t>(minirpc::StatusCode::kNotImplemented));
+    assert(response.error_message == "unsupported RPC codec");
+    assert(invoked.load() == 0);
+    assert(server.metrics().total_requests() == 1);
+    assert(server.metrics().failed_requests() == 1);
+    assert(server.metrics().pending_requests() == 0);
+
     server.Stop();
 }
 
@@ -702,6 +742,7 @@ void TestGracefulTimeoutCancelsAcceptedResponseWrite() {
 }  // namespace
 
 int main() {
+    TestImmediateDestructionStopsTimeoutCleaner();
     TestBasicEcho();
     TestTimeoutCleanup();
     TestEarlierDeadlineWakesTimeoutCleaner();
@@ -711,6 +752,7 @@ int main() {
     TestCloseFailsPending();
     TestServerNotRunning();
     TestServerMetricsFailures();
+    TestServerRejectsUnsupportedRpcCodec();
     TestServerRejectsExpiredDeadlineBeforeHandler();
     TestGracefulStopLetsInflightRequestFinish();
     TestGracePeriodTimeoutIsRecorded();

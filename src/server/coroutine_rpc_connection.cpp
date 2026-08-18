@@ -1,6 +1,5 @@
 #include "minirpc/server/coroutine_rpc_connection.h"
 
-#include <atomic>
 #include <chrono>
 #include <exception>
 #include <memory>
@@ -25,7 +24,7 @@ bool DeadlineExpired(const RpcRequest& request) {
 
 struct PendingResponse {
     std::mutex mutex;
-    std::atomic<bool> waiting{false};
+    bool waiting = false;
     bool done = false;
     RpcResponse response;
 };
@@ -35,11 +34,15 @@ struct PendingResponse {
 CoroutineRpcConnection::CoroutineRpcConnection(CoroutineIoContext* io,
                                                ServiceRegistry* registry,
                                                ThreadPool* thread_pool,
-                                               RpcMetrics* metrics)
+                                               RpcMetrics* metrics,
+                                               RequestAdmission request_admission,
+                                               RequestCompletion request_completion)
     : io_(io),
       registry_(registry),
       thread_pool_(thread_pool),
       metrics_(metrics),
+      request_admission_(std::move(request_admission)),
+      request_completion_(std::move(request_completion)),
       channel_(io) {}
 
 Status CoroutineRpcConnection::Serve(int fd) {
@@ -60,13 +63,31 @@ Status CoroutineRpcConnection::Serve(int fd) {
         const auto start_time = std::chrono::steady_clock::now();
         if (metrics_ != nullptr) {
             metrics_->RecordRequest();
+        }
+        if (request_admission_ && !request_admission_()) {
+            return RejectRequest(fd, frame.request_id, start_time);
+        }
+        if (!request_admission_ && metrics_ != nullptr) {
             metrics_->IncrementPendingRequests();
         }
         const uint64_t request_id = frame.request_id;
-        RpcResponse response = thread_pool_ == nullptr
-                                   ? ProcessFrame(frame)
-                                   : ProcessFrameThroughThreadPool(std::move(frame));
-        status = channel_.WriteFrame(fd, MakeResponseFrame(request_id, response));
+        RpcResponse response;
+        try {
+            response = thread_pool_ == nullptr
+                           ? ProcessFrame(frame)
+                           : ProcessFrameThroughThreadPool(std::move(frame));
+            ProtocolFrame response_frame;
+            status = PrepareResponseFrame(request_id, &response, &response_frame);
+            if (status.ok()) {
+                status = channel_.WriteFrame(fd, response_frame);
+            }
+        } catch (const std::exception& ex) {
+            response = MakeErrorResponse(request_id, StatusCode::kServerError, ex.what());
+            status = Status::Error(StatusCode::kServerError, ex.what());
+        } catch (...) {
+            response = MakeErrorResponse(request_id, StatusCode::kServerError, "unknown server error");
+            status = Status::Error(StatusCode::kServerError, "unknown server error");
+        }
         FinishRequestMetrics(response, status, start_time);
         if (!status.ok()) {
             return status;
@@ -74,8 +95,66 @@ Status CoroutineRpcConnection::Serve(int fd) {
     }
 }
 
+Status CoroutineRpcConnection::RejectRequest(
+    int fd,
+    uint64_t request_id,
+    std::chrono::steady_clock::time_point start_time) {
+    RpcResponse response = MakeErrorResponse(
+        request_id, StatusCode::kServerError, "server shutting down");
+    ProtocolFrame response_frame;
+    Status write_status = PrepareResponseFrame(request_id, &response, &response_frame);
+    if (write_status.ok()) {
+        write_status = channel_.WriteFrame(fd, response_frame);
+    }
+    if (metrics_ != nullptr) {
+        metrics_->RecordRejected();
+        if (write_status.ok()) {
+            metrics_->RecordResponse();
+        }
+        metrics_->RecordLatency(std::chrono::steady_clock::now() - start_time);
+    }
+    return write_status;
+}
+
+Status CoroutineRpcConnection::PrepareResponseFrame(uint64_t request_id,
+                                                     RpcResponse* response,
+                                                     ProtocolFrame* frame) const {
+    if (response == nullptr || frame == nullptr) {
+        return Status::Error(StatusCode::kSerializeError, "invalid response output");
+    }
+
+    const auto encode = [this, request_id](const RpcResponse& value,
+                                           ProtocolFrame* output) -> Status {
+        try {
+            ProtocolFrame encoded = MakeResponseFrame(request_id, value);
+            if (encoded.body.size() > kDefaultMaxFrameBodySize) {
+                return Status::Error(StatusCode::kSerializeError, "response body too large");
+            }
+            *output = std::move(encoded);
+            return Status::Ok();
+        } catch (const BodyCodecError& ex) {
+            return Status::Error(StatusCode::kSerializeError, ex.what());
+        } catch (const std::exception& ex) {
+            return Status::Error(StatusCode::kSerializeError, ex.what());
+        } catch (...) {
+            return Status::Error(StatusCode::kSerializeError, "failed to serialize response body");
+        }
+    };
+
+    Status status = encode(*response, frame);
+    if (status.ok()) {
+        return status;
+    }
+    *response = MakeErrorResponse(request_id, StatusCode::kSerializeError, status.message());
+    return encode(*response, frame);
+}
+
 RpcResponse CoroutineRpcConnection::ProcessFrame(const ProtocolFrame& frame) {
     RpcResponse response;
+    if (frame.codec_type != CodecType::kProtobuf) {
+        return MakeErrorResponse(
+            frame.request_id, StatusCode::kNotImplemented, "unsupported RPC codec");
+    }
     try {
         RpcRequest request = DecodeRequestBody(frame.request_id, frame.body);
         if (DeadlineExpired(request)) {
@@ -107,25 +186,28 @@ RpcResponse CoroutineRpcConnection::ProcessFrame(const ProtocolFrame& frame) {
 }
 
 RpcResponse CoroutineRpcConnection::ProcessFrameThroughThreadPool(ProtocolFrame frame) {
-    Coroutine* coroutine = Coroutine::Current();
-    if (coroutine == nullptr || io_ == nullptr || thread_pool_ == nullptr) {
+    Coroutine* current = Coroutine::Current();
+    if (current == nullptr || !current->handle() || io_ == nullptr || thread_pool_ == nullptr) {
         return MakeErrorResponse(frame.request_id, StatusCode::kServerError, "invalid coroutine thread pool dispatch");
     }
+    const CoroutineHandle coroutine = current->handle();
 
     const uint64_t request_id = frame.request_id;
     auto pending = std::make_shared<PendingResponse>();
     io_->AddExternalWait();
     if (!thread_pool_->Post([this, frame = std::move(frame), pending, coroutine] {
             RpcResponse response = ProcessFrame(frame);
+            bool should_schedule = false;
             {
                 std::lock_guard<std::mutex> lock(pending->mutex);
                 pending->response = std::move(response);
                 pending->done = true;
+                should_schedule = pending->waiting;
             }
-            io_->CompleteExternalWait();
-            if (pending->waiting.load(std::memory_order_acquire)) {
+            if (should_schedule) {
                 io_->Schedule(coroutine);
             }
+            io_->CompleteExternalWait();
     })) {
         io_->CompleteExternalWait();
         if (metrics_ != nullptr) {
@@ -138,20 +220,16 @@ RpcResponse CoroutineRpcConnection::ProcessFrameThroughThreadPool(ProtocolFrame 
         {
             std::lock_guard<std::mutex> lock(pending->mutex);
             if (pending->done) {
-                pending->waiting.store(false, std::memory_order_release);
+                pending->waiting = false;
                 return std::move(pending->response);
             }
-        }
-        pending->waiting.store(true, std::memory_order_release);
-        {
-            std::lock_guard<std::mutex> lock(pending->mutex);
-            if (pending->done) {
-                pending->waiting.store(false, std::memory_order_release);
-                return std::move(pending->response);
-            }
+            pending->waiting = true;
         }
         Scheduler::SuspendCurrent();
-        pending->waiting.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(pending->mutex);
+            pending->waiting = false;
+        }
     }
 }
 
@@ -159,6 +237,7 @@ void CoroutineRpcConnection::FinishRequestMetrics(const RpcResponse& response,
                                                   const Status& write_status,
                                                   std::chrono::steady_clock::time_point start_time) {
     if (metrics_ == nullptr) {
+        CompletePendingRequest();
         return;
     }
     const bool already_rejected = response.error_message == "thread pool queue is full";
@@ -179,7 +258,15 @@ void CoroutineRpcConnection::FinishRequestMetrics(const RpcResponse& response,
         }
     }
     metrics_->RecordLatency(std::chrono::steady_clock::now() - start_time);
-    metrics_->DecrementPendingRequests();
+    CompletePendingRequest();
+}
+
+void CoroutineRpcConnection::CompletePendingRequest() {
+    if (request_completion_) {
+        request_completion_();
+    } else if (metrics_ != nullptr) {
+        metrics_->DecrementPendingRequests();
+    }
 }
 
 ProtocolFrame CoroutineRpcConnection::MakeResponseFrame(uint64_t request_id,

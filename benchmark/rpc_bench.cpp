@@ -30,14 +30,6 @@ namespace {
 #define MINIRPC_GIT_REVISION "unknown"
 #endif
 
-#ifndef MINIRPC_LIBURING_VERSION
-#define MINIRPC_LIBURING_VERSION "unknown"
-#endif
-
-#ifndef MINIRPC_TCP_SERVER_BACKEND_NAME
-#define MINIRPC_TCP_SERVER_BACKEND_NAME "unknown"
-#endif
-
 struct Options {
     std::string host = "127.0.0.1";
     std::string server = "both";
@@ -536,9 +528,8 @@ int main(int argc, char** argv) {
     std::cout << "commit=" << MINIRPC_GIT_REVISION
               << " kernel=" << KernelVersion()
               << " compiler=\"" << CompilerVersion() << '"'
-              << " tcp_backend=" << MINIRPC_TCP_SERVER_BACKEND_NAME
-              << " coroutine_io_backend=epoll"
-              << " liburing=" << MINIRPC_LIBURING_VERSION << '\n';
+              << " reactor_io_backend=epoll"
+              << " coroutine_io_backend=epoll\n";
 
     for (std::size_t payload_size : payload_sizes) {
         Options run_options = options;

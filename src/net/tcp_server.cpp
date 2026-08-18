@@ -5,20 +5,9 @@
 #include "minirpc/net/tcp_server_backend.h"
 
 namespace minirpc {
-namespace {
-
-std::unique_ptr<TcpServerBackend> MakeConfiguredTcpServerBackend() {
-#if defined(MINIRPC_TCP_SERVER_BACKEND_IO_URING)
-    return MakeIoUringTcpServerBackend();
-#else
-    return MakeEpollTcpServerBackend();
-#endif
-}
-
-}  // namespace
 
 struct TcpServer::Impl {
-    std::unique_ptr<TcpServerBackend> backend = MakeConfiguredTcpServerBackend();
+    std::unique_ptr<TcpServerBackend> backend = MakeEpollTcpServerBackend();
 };
 
 TcpServer::TcpServer()

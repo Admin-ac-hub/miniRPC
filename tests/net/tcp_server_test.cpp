@@ -297,6 +297,43 @@ void TestStopAcceptingKeepsExistingConnectionAlive() {
     server.Stop();
 }
 
+void TestMaxConnectionsRejectsExcessAndReleasesCapacity() {
+    minirpc::TcpServer server;
+    minirpc::TcpServerOptions options;
+    options.max_connections = 2;
+    server.SetOptions(options);
+
+    std::atomic<int> open_count{0};
+    std::atomic<int> close_count{0};
+    server.SetOnOpen([&](minirpc::ConnectionId, uint64_t) {
+        open_count.fetch_add(1, std::memory_order_relaxed);
+    });
+    server.SetOnClose([&](minirpc::ConnectionId, uint64_t) {
+        close_count.fetch_add(1, std::memory_order_relaxed);
+    });
+    assert(server.Start({"127.0.0.1", 19235}).ok());
+
+    const int first_fd = ConnectRaw(19235);
+    const int second_fd = ConnectRaw(19235);
+    assert(WaitUntil([&] { return open_count.load() == 2; }, std::chrono::seconds(2)));
+
+    const int rejected_fd = ConnectRaw(19235);
+    SetRecvTimeout(rejected_fd, 1000);
+    AssertPeerClosed(rejected_fd);
+    ::close(rejected_fd);
+    assert(open_count.load() == 2);
+
+    ::close(first_fd);
+    assert(WaitUntil([&] { return close_count.load() == 1; }, std::chrono::seconds(2)));
+
+    const int replacement_fd = ConnectRaw(19235);
+    assert(WaitUntil([&] { return open_count.load() == 3; }, std::chrono::seconds(2)));
+
+    ::close(second_fd);
+    ::close(replacement_fd);
+    server.Stop();
+}
+
 void TestSendFrameOnStaleGenerationIsDropped() {
     minirpc::TcpServer server;
     std::mutex m;
@@ -745,7 +782,7 @@ void TestWriteBufferHardLimitOnlyClosesSlowConnection() {
     assert(close_count.load() == 2);
 }
 
-void TestStopWithMoreIdleConnectionsThanRingDepth() {
+void TestStopWithManyIdleConnections() {
     constexpr int kConnectionCount = 300;
 
     minirpc::TcpServer server;
@@ -987,6 +1024,7 @@ int main() {
     TestStartFailsOnOccupiedPort();
     TestStartCanRecoverAfterOccupiedPortFailure();
     TestStopAcceptingKeepsExistingConnectionAlive();
+    TestMaxConnectionsRejectsExcessAndReleasesCapacity();
     TestSendFrameOnStaleGenerationIsDropped();
     TestCloseConnectionChecksGenerationAndAllowsWildcard();
     TestFrameCallbackCanCloseConnection();
@@ -999,7 +1037,7 @@ int main() {
     TestConnectionChurnAndPromptStopWithIdleConnections();
     TestStopCancelsInFlightSend();
     TestWriteBufferHardLimitOnlyClosesSlowConnection();
-    TestStopWithMoreIdleConnectionsThanRingDepth();
+    TestStopWithManyIdleConnections();
     TestDelayedWorkerResponseAfterPeerCloseIsDropped();
     TestCloseConnectionFiresOnCloseExactlyOnce();
     TestCallbacksStayOnReactorThreadDuringStop();

@@ -10,15 +10,16 @@ void TimerQueue::SetScheduler(Scheduler* scheduler) noexcept {
     scheduler_ = scheduler;
 }
 
-bool TimerQueue::ScheduleAt(Coroutine* coroutine, TimePoint deadline) {
-    if (coroutine == nullptr || coroutine->Finished()) {
+bool TimerQueue::ScheduleAt(CoroutineHandle coroutine, TimePoint deadline) {
+    Scheduler* scheduler = ResolveScheduler();
+    if (stopped_ || !coroutine || scheduler == nullptr || !scheduler->Contains(coroutine)) {
         return false;
     }
     timers_.push(Timer{deadline, next_sequence_++, coroutine});
     return true;
 }
 
-bool TimerQueue::ScheduleAfter(Coroutine* coroutine, Duration delay) {
+bool TimerQueue::ScheduleAfter(CoroutineHandle coroutine, Duration delay) {
     if (delay < Duration::zero()) {
         delay = Duration::zero();
     }
@@ -33,16 +34,22 @@ bool TimerQueue::SleepFor(Duration delay) {
 }
 
 bool TimerQueue::SleepUntil(TimePoint deadline) {
-    Coroutine* coroutine = Coroutine::Current();
+    Coroutine* current = Coroutine::Current();
     Scheduler* scheduler = ResolveScheduler();
-    if (coroutine == nullptr || scheduler == nullptr) {
+    if (current == nullptr || scheduler == nullptr) {
+        return false;
+    }
+    const CoroutineHandle coroutine = current->handle();
+    if (!sleeping_.insert(coroutine.id).second) {
         return false;
     }
     if (!ScheduleAt(coroutine, deadline)) {
+        sleeping_.erase(coroutine.id);
         return false;
     }
     Scheduler::SuspendCurrent();
-    return true;
+    sleeping_.erase(coroutine.id);
+    return cancelled_.erase(coroutine.id) == 0;
 }
 
 std::size_t TimerQueue::DrainExpired(TimePoint now) {
@@ -55,12 +62,35 @@ std::size_t TimerQueue::DrainExpired(TimePoint now) {
     while (!timers_.empty() && timers_.top().deadline <= now) {
         Timer timer = timers_.top();
         timers_.pop();
-        if (timer.coroutine != nullptr && !timer.coroutine->Finished()) {
+        if (scheduler->Contains(timer.coroutine)) {
             scheduler->Schedule(timer.coroutine);
             ++drained;
         }
     }
     return drained;
+}
+
+std::size_t TimerQueue::CancelAll() {
+    stopped_ = true;
+    Scheduler* scheduler = ResolveScheduler();
+    if (scheduler == nullptr) {
+        return 0;
+    }
+
+    std::size_t cancelled = 0;
+    while (!timers_.empty()) {
+        const Timer timer = timers_.top();
+        timers_.pop();
+        if (!scheduler->Contains(timer.coroutine)) {
+            continue;
+        }
+        if (sleeping_.count(timer.coroutine.id) > 0) {
+            cancelled_.insert(timer.coroutine.id);
+        }
+        scheduler->Schedule(timer.coroutine);
+        ++cancelled;
+    }
+    return cancelled;
 }
 
 std::optional<TimerQueue::Duration> TimerQueue::TimeUntilNext(TimePoint now) const {

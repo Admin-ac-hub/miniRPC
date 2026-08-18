@@ -8,6 +8,7 @@
 
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -32,15 +33,29 @@ int ClampTimeoutMs(TimerQueue::Duration duration) {
 CoroutineIoContext::CoroutineIoContext(std::size_t default_stack_size)
     : scheduler_(default_stack_size),
       timers_(&scheduler_),
-      epoll_fd_(::epoll_create1(EPOLL_CLOEXEC)),
-      wake_fd_(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)),
+      epoll_fd_(-1),
+      wake_fd_(-1),
+      initialization_error_(0),
+      run_error_(0),
       stopping_(false),
       external_waits_(0) {
-    if (epoll_fd_ != -1 && wake_fd_ != -1) {
-        epoll_event event{};
-        event.events = EPOLLIN;
-        event.data.fd = wake_fd_;
-        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wake_fd_, &event) == -1) {
+    epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd_ == -1) {
+        initialization_error_ = errno;
+        return;
+    }
+    wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (wake_fd_ == -1) {
+        initialization_error_ = errno;
+        return;
+    }
+
+    epoll_event event{};
+    event.events = EPOLLIN;
+    event.data.fd = wake_fd_;
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wake_fd_, &event) == -1) {
+        initialization_error_ = errno;
+        if (wake_fd_ != -1) {
             ::close(wake_fd_);
             wake_fd_ = -1;
         }
@@ -58,19 +73,31 @@ CoroutineIoContext::~CoroutineIoContext() {
     }
 }
 
-Coroutine* CoroutineIoContext::Spawn(Task task) {
+CoroutineHandle CoroutineIoContext::Spawn(Task task) {
     return scheduler_.Spawn(std::move(task));
 }
 
-void CoroutineIoContext::Schedule(Coroutine* coroutine) {
-    if (coroutine == nullptr || coroutine->Finished()) {
+void CoroutineIoContext::Schedule(CoroutineHandle coroutine) {
+    if (!coroutine) {
         return;
     }
+    (void)Post([this, coroutine] { scheduler_.Schedule(coroutine); });
+}
+
+bool CoroutineIoContext::Post(Task task) {
+    if (!task) {
+        return false;
+    }
+    if (Current() == this) {
+        task();
+        return true;
+    }
     {
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        pending_ready_.push_back(coroutine);
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        pending_controls_.push_back(std::move(task));
     }
     Wake();
+    return true;
 }
 
 void CoroutineIoContext::AddExternalWait() noexcept {
@@ -83,22 +110,50 @@ void CoroutineIoContext::CompleteExternalWait() noexcept {
            !external_waits_.compare_exchange_weak(
                current, current - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
     }
+    Wake();
 }
 
 void CoroutineIoContext::Run() {
+    if (!valid()) {
+        return;
+    }
     CoroutineIoContext* previous = t_current_io_context;
     t_current_io_context = this;
 
     epoll_event events[kMaxEvents];
-    while (!stopping_.load(std::memory_order_acquire) && HasPendingWork()) {
-        DrainPendingReady();
+    bool shutdown_cancelled = false;
+    while (HasPendingWork()) {
+        DrainControls();
+        if (stopping_.load(std::memory_order_acquire) && !shutdown_cancelled) {
+            CancelAllWaiters();
+            (void)timers_.CancelAll();
+            shutdown_cancelled = true;
+        }
         scheduler_.Run();
         timers_.DrainExpired();
-        DrainPendingReady();
+        DrainControls();
         if (scheduler_.ready_count() > 0) {
             continue;
         }
         if (!HasPendingWork()) {
+            break;
+        }
+        if (stopping_.load(std::memory_order_acquire) && !shutdown_cancelled) {
+            continue;
+        }
+
+        if (run_error_.load(std::memory_order_acquire) != 0) {
+            pollfd wake_event{};
+            wake_event.fd = wake_fd_;
+            wake_event.events = POLLIN;
+            const int wake_ready = ::poll(&wake_event, 1, -1);
+            if (wake_ready == -1 && errno == EINTR) {
+                continue;
+            }
+            if (wake_ready > 0) {
+                DrainWake();
+                continue;
+            }
             break;
         }
 
@@ -108,7 +163,9 @@ void CoroutineIoContext::Run() {
             if (errno == EINTR) {
                 continue;
             }
-            break;
+            run_error_.store(errno, std::memory_order_release);
+            stopping_.store(true, std::memory_order_release);
+            continue;
         }
         for (int i = 0; i < ready; ++i) {
             const int fd = static_cast<int>(events[i].data.fd);
@@ -119,7 +176,7 @@ void CoroutineIoContext::Run() {
             }
         }
         timers_.DrainExpired();
-        DrainPendingReady();
+        DrainControls();
     }
 
     t_current_io_context = previous;
@@ -149,7 +206,6 @@ ssize_t CoroutineIoContext::Read(int fd, void* buffer, std::size_t size) {
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             if (!WaitReadable(fd)) {
-                errno = EINVAL;
                 return -1;
             }
             continue;
@@ -172,7 +228,6 @@ ssize_t CoroutineIoContext::WriteAll(int fd, const void* buffer, std::size_t siz
         }
         if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             if (!WaitWritable(fd)) {
-                errno = EINVAL;
                 return -1;
             }
             continue;
@@ -193,14 +248,26 @@ TimerQueue& CoroutineIoContext::timers() noexcept {
 std::size_t CoroutineIoContext::waiting_count() const noexcept {
     std::size_t count = 0;
     for (const auto& [_, waiters] : waiters_) {
-        if (waiters.read != nullptr) {
+        if (waiters.read) {
             ++count;
         }
-        if (waiters.write != nullptr) {
+        if (waiters.write) {
             ++count;
         }
     }
     return count;
+}
+
+bool CoroutineIoContext::valid() const noexcept {
+    return epoll_fd_ != -1 && wake_fd_ != -1 && initialization_error_ == 0;
+}
+
+int CoroutineIoContext::initialization_error() const noexcept {
+    return initialization_error_;
+}
+
+int CoroutineIoContext::run_error() const noexcept {
+    return run_error_.load(std::memory_order_acquire);
 }
 
 CoroutineIoContext* CoroutineIoContext::Current() noexcept {
@@ -208,21 +275,32 @@ CoroutineIoContext* CoroutineIoContext::Current() noexcept {
 }
 
 bool CoroutineIoContext::WaitFd(int fd, WaitKind kind) {
-    if (fd < 0 || epoll_fd_ == -1 || Coroutine::Current() == nullptr) {
+    Coroutine* current = Coroutine::Current();
+    if (stopping_.load(std::memory_order_acquire)) {
+        errno = ECANCELED;
+        return false;
+    }
+    if (fd < 0 || epoll_fd_ == -1 || current == nullptr || !current->handle()) {
+        errno = EINVAL;
         return false;
     }
     FdWaiters& waiters = waiters_[fd];
-    Coroutine*& slot = kind == WaitKind::kRead ? waiters.read : waiters.write;
-    if (slot != nullptr) {
+    CoroutineHandle& slot = kind == WaitKind::kRead ? waiters.read : waiters.write;
+    if (slot) {
+        errno = EBUSY;
         return false;
     }
-    slot = Coroutine::Current();
+    slot = current->handle();
     if (!UpdateInterest(fd, &waiters)) {
-        slot = nullptr;
+        slot = {};
         UpdateInterest(fd, &waiters);
         return false;
     }
     Scheduler::SuspendCurrent();
+    if (stopping_.load(std::memory_order_acquire)) {
+        errno = ECANCELED;
+        return false;
+    }
     return true;
 }
 
@@ -236,23 +314,41 @@ void CoroutineIoContext::WakeFd(int fd, std::uint32_t events) {
     const bool wake_read = (events & (EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0;
     const bool wake_write = (events & (EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0;
 
-    Coroutine* read = nullptr;
-    Coroutine* write = nullptr;
+    CoroutineHandle read;
+    CoroutineHandle write;
     if (wake_read) {
         read = waiters.read;
-        waiters.read = nullptr;
+        waiters.read = {};
     }
     if (wake_write) {
         write = waiters.write;
-        waiters.write = nullptr;
+        waiters.write = {};
     }
 
     (void)UpdateInterest(fd, &waiters);
-    if (read != nullptr) {
+    if (read) {
         scheduler_.Schedule(read);
     }
-    if (write != nullptr && write != read) {
+    if (write && write != read) {
         scheduler_.Schedule(write);
+    }
+}
+
+void CoroutineIoContext::CancelAllWaiters() {
+    std::vector<CoroutineHandle> cancelled;
+    cancelled.reserve(waiters_.size() * 2);
+    for (const auto& [fd, waiters] : waiters_) {
+        (void)::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+        if (waiters.read) {
+            cancelled.push_back(waiters.read);
+        }
+        if (waiters.write && waiters.write != waiters.read) {
+            cancelled.push_back(waiters.write);
+        }
+    }
+    waiters_.clear();
+    for (CoroutineHandle coroutine : cancelled) {
+        scheduler_.Schedule(coroutine);
     }
 }
 
@@ -262,10 +358,10 @@ bool CoroutineIoContext::UpdateInterest(int fd, FdWaiters* waiters) {
     }
 
     std::uint32_t events = EPOLLRDHUP;
-    if (waiters->read != nullptr) {
+    if (waiters->read) {
         events |= EPOLLIN;
     }
-    if (waiters->write != nullptr) {
+    if (waiters->write) {
         events |= EPOLLOUT;
     }
 
@@ -305,14 +401,14 @@ void CoroutineIoContext::DrainWake() {
     }
 }
 
-void CoroutineIoContext::DrainPendingReady() {
-    std::vector<Coroutine*> pending;
+void CoroutineIoContext::DrainControls() {
+    std::vector<Task> controls;
     {
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        pending.swap(pending_ready_);
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        controls.swap(pending_controls_);
     }
-    for (Coroutine* coroutine : pending) {
-        scheduler_.Schedule(coroutine);
+    for (Task& control : controls) {
+        control();
     }
 }
 
@@ -334,12 +430,12 @@ void CoroutineIoContext::Wake() {
 }
 
 bool CoroutineIoContext::HasPendingWork() const {
-    bool has_pending_ready = false;
+    bool has_pending_controls = false;
     {
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        has_pending_ready = !pending_ready_.empty();
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        has_pending_controls = !pending_controls_.empty();
     }
-    return scheduler_.ready_count() > 0 || has_pending_ready || !timers_.empty() ||
+    return scheduler_.ready_count() > 0 || has_pending_controls || !timers_.empty() ||
            !waiters_.empty() || external_waits_.load(std::memory_order_acquire) > 0;
 }
 

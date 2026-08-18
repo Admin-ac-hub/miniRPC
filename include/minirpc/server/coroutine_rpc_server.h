@@ -3,6 +3,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -37,23 +39,36 @@ public:
     std::string MetricsText() const;
 
 private:
+    enum class State : uint64_t {
+        kRunning = 0,
+        kDraining = 1,
+        kStopped = 2,
+    };
+
     Status SetupListener();
     void AcceptLoop();
+    bool TryAdmitRequest();
+    void CompletePendingRequest();
     void TrackClientFd(int fd);
     void CloseClientFd(int fd);
     void CloseAllClientFds();
     void CloseListenFd();
-    void WaitForPendingRequests(std::chrono::milliseconds grace_period) const;
+    bool WaitForPendingRequests(std::chrono::milliseconds grace_period);
+    bool PostIoAndWait(CoroutineIoContext::Task task);
 
     std::atomic<bool> running_;
+    std::atomic<bool> io_running_;
+    std::atomic<State> state_;
     Endpoint endpoint_;
     ServiceRegistry registry_;
     ThreadPool thread_pool_;
     RpcMetrics metrics_;
-    CoroutineIoContext io_;
+    std::unique_ptr<CoroutineIoContext> io_;
     std::thread io_thread_;
     int listen_fd_;
-    std::mutex clients_mutex_;
+    std::mutex operation_mutex_;
+    std::mutex drain_mutex_;
+    std::condition_variable drain_cv_;
     std::unordered_set<int> client_fds_{};
 };
 

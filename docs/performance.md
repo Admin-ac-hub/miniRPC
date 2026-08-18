@@ -1,10 +1,10 @@
 # 性能分析与压测方法
 
-miniRPC 的压测目标不是只报告最高 QPS，而是用可复现的固定场景做两类独立比较：
+miniRPC 的压测以稳定 Reactor 路径为基线，并用可复现的固定场景附带比较实验性协程路径：
 
 ```text
-Reactor backend: epoll vs io_uring
-Control flow: Reactor vs Coroutine + epoll
+Reactor + epoll + ThreadPool
+Coroutine + epoll + ThreadPool
 ```
 
 当前实测数据和环境信息见 [benchmark_report.md](benchmark_report.md)。
@@ -19,47 +19,16 @@ Control flow: Reactor vs Coroutine + epoll
 - `--server both` 时，两条服务端路径按轮次交替先运行，降低固定执行顺序带来的偏差。
 - `--runs N` 默认执行 5 轮。QPS、耗时、延迟和 CPU 时间按字段取中位数；成功、失败、拒绝、超时和状态码计数跨所有轮求和，避免偶发错误被中位数隐藏。
 
-这套模型适合比较当前两条实现路径，但不是开放到达率测试，也不能把结果直接解释为独立服务端的线上容量或 SLA。
+这套模型适合验证 Reactor 基线并比较控制流差异，但不是开放到达率测试，也不能把结果直接解释为独立服务端的线上容量或 SLA。
 
-## Reactor Backend A/B
+## 固定场景
 
-Reactor backend 在 CMake 配置期固定。同环境 A/B 必须分别构建两个目录，只运行 `--server reactor`；不能用 `--server both` 代替，因为后者比较的是 Reactor 与 Coroutine，而 Coroutine 路径仍固定使用 epoll。
-
-```sh
-cmake -S . -B build-epoll-release -DCMAKE_BUILD_TYPE=Release \
-  -DMINIRPC_TCP_SERVER_BACKEND=epoll
-cmake -S . -B build-uring-release -DCMAKE_BUILD_TYPE=Release \
-  -DMINIRPC_TCP_SERVER_BACKEND=io_uring
-
-cmake --build build-epoll-release -j
-cmake --build build-uring-release -j
-```
-
-`rpc_bench` 首行输出 `commit`、`kernel`、`compiler`、`tcp_backend`、`coroutine_io_backend` 和 `liburing`。A/B 结果只有在 commit、kernel、compiler 和负载参数相同，且 `tcp_backend` 分别为 `epoll`、`io_uring` 时才可比较。
-
-除下方三组固定场景外，backend A/B 还使用 128/512 connections 和 64 KiB payload。当前 harness 为每个连接创建一个客户端线程，因此 512 连接结果会混入大量客户端线程调度；不使用 2000 connections 宣称服务端容量。慢读和 connect/disconnect churn 当前由自动化正确性测试覆盖，尚未作为 `rpc_bench` 的性能模式。慢读 shutdown 回归使用 8 MiB 响应和 4 KiB client receive buffer，等待背压后要求 `Stop()` 持续 Draining，直到整帧 write completion 才能返回。
-
-## Reactor / Coroutine 固定场景
-
-最终报告固定使用 Release 构建、16B payload、4 个业务 worker 和 `10000` 的线程池队列上限：
-
-| 场景 | connections | requests/run | handler delay | 观察目标 |
-| --- | ---: | ---: | ---: | --- |
-| Baseline Echo | 8 | 100000 | 0ms | 小包协议、调度和写回路径的端到端表现 |
-| 64 Connections | 64 | 100000 | 0ms | 增加活跃连接和最大在途请求后的变化 |
-| Slow Handler | 16 | 1600 | 5ms | 业务 worker 排队成为主要限制时的表现 |
-
-对应命令：
+最终报告只保留一组可复现的连接压力场景：Release 构建、32 条连接、每轮 100000
+个请求、16B payload、4 个业务 worker 和 `10000` 的线程池队列上限。
 
 ```sh
-./build/rpc_bench --server both --connections 8 --requests 100000 \
-  --runs 5 --payload-size 16 --handler-delay-ms 0 --timeout-ms 3000 --port 19900
-
-./build/rpc_bench --server both --connections 64 --requests 100000 \
+./build-release/rpc_bench --server both --connections 32 --requests 100000 \
   --runs 5 --payload-size 16 --handler-delay-ms 0 --timeout-ms 3000 --port 19920
-
-./build/rpc_bench --server both --connections 16 --requests 1600 \
-  --runs 5 --payload-size 16 --handler-delay-ms 5 --timeout-ms 5000 --port 19940
 ```
 
 输出包含两部分：`raw runs` 保留每轮原始值，`summary` 输出性能字段中位数和可靠性计数总和。主要字段为：
@@ -68,8 +37,6 @@ cmake --build build-uring-release -j
 - `usr_s_med`、`sys_s_med`：`getrusage(RUSAGE_SELF)` 得到的同进程 CPU 秒数中位数，不是 CPU 利用率。
 - `fail_sum`、`rej_sum`、`tout_sum`：所有轮的失败、拒绝和超时总数。
 - `statuses_sum`：所有轮的响应状态码分布；`0:500000` 表示 5 轮共 500000 个请求全部成功。
-
-对于 backend A/B，连续多组五轮中位数出现超过 5% 的持续 QPS、P99 或 CPU 回退时，停止讨论切换默认值并先做 profiling。2026-08-07 的 64 KiB 场景触发了这个 gate，详见 [benchmark_report.md](benchmark_report.md)，因此默认值仍是 epoll。
 
 ## 指标闭环
 
@@ -96,8 +63,7 @@ cmake --build build-uring-release -j
 - CPU 数据包含同一进程内的客户端线程和服务端线程，只适合同一环境中的路径对比。
 - 当前表格不包含 server-only CPU、cycles/instructions、RSS 或 context switches；这些指标需要外部分进程与 `perf stat`/进程采样，缺少证据时不作相关归因。
 - 分位数来自客户端端到端延迟；服务端 metrics 的分位数用于定位服务端处理阶段，两者不能混为一谈。
-- Slow Handler 场景对所有业务请求都增加固定延迟，只能说明结果与 worker 容量和排队限制一致；要证明慢请求不影响快请求，还需要单独的混合快慢流量场景。
-- 当前 benchmark CLI 不修改线程池容量。队列拒绝和慢连接背压由 `coroutine_rpc_server_test`、`tcp_server_test` 等自动化测试覆盖，不在结果表中制造未落地的可配置场景。
+- 当前 benchmark CLI 不修改线程池容量。队列拒绝和慢连接背压主要由 `tcp_server_test`、`rpc_client_test` 覆盖，协程路径另有独立回归，不在结果表中制造未落地的可配置场景。
 
 ## 分析顺序
 
@@ -111,8 +77,7 @@ cmake --build build-uring-release -j
 ## 简历口径
 
 ```text
-实现公共 API 不变、构建期可选 epoll/io_uring 的 Reactor TCP backend，并保留
-Coroutine + epoll 路径；设计同进程闭环压测，在固定小包、连接压力、慢 handler
-和 64 KiB 场景下各运行 5 轮，用中位数比较 QPS 与 P50/P95/P99，并汇总全部
-轮次的失败和状态码。A/B 发现 io_uring 在 64 KiB 场景持续回退，因此保持 epoll 默认值。
+实现以 epoll + eventfd 驱动的 Reactor RPC 服务端，将 IO 与业务线程池隔离；
+设计同进程闭环压测，在固定连接压力场景下记录 QPS、P50/P95/P99、失败、
+拒绝、超时和状态码，并用实验性协程路径做控制流对比。
 ```

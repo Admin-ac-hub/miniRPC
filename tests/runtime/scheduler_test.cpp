@@ -24,7 +24,7 @@ void TestRoundRobinYield() {
 
     assert((events == std::vector<int>{1, 2, 3}));
     assert(scheduler.ready_count() == 0);
-    assert(scheduler.coroutine_count() == 2);
+    assert(scheduler.coroutine_count() == 0);
     assert(minirpc::Scheduler::Current() == nullptr);
     assert(minirpc::Coroutine::Current() == nullptr);
 }
@@ -32,7 +32,7 @@ void TestRoundRobinYield() {
 void TestSuspendAndExternalSchedule() {
     minirpc::Scheduler scheduler;
     std::vector<int> events;
-    minirpc::Coroutine* coroutine = scheduler.Spawn([&] {
+    const minirpc::CoroutineHandle coroutine = scheduler.Spawn([&] {
         events.push_back(1);
         minirpc::Scheduler::SuspendCurrent();
         events.push_back(2);
@@ -41,23 +41,60 @@ void TestSuspendAndExternalSchedule() {
     scheduler.Run();
     assert((events == std::vector<int>{1}));
     assert(scheduler.ready_count() == 0);
-    assert(!coroutine->Finished());
+    assert(scheduler.Contains(coroutine));
 
     scheduler.Schedule(coroutine);
     assert(scheduler.ready_count() == 1);
     scheduler.Run();
     assert((events == std::vector<int>{1, 2}));
-    assert(coroutine->Finished());
+    assert(!scheduler.Contains(coroutine));
 }
 
 void TestFinishedCoroutineIsNotScheduled() {
     minirpc::Scheduler scheduler;
-    minirpc::Coroutine* coroutine = scheduler.Spawn([] {});
+    const minirpc::CoroutineHandle coroutine = scheduler.Spawn([] {});
     scheduler.Run();
-    assert(coroutine->Finished());
+    assert(!scheduler.Contains(coroutine));
 
     scheduler.Schedule(coroutine);
     assert(scheduler.ready_count() == 0);
+}
+
+void TestDuplicateScheduleOnlyResumesOnce() {
+    minirpc::Scheduler scheduler;
+    int resume_count = 0;
+    const minirpc::CoroutineHandle coroutine = scheduler.Spawn([&] {
+        minirpc::Scheduler::SuspendCurrent();
+        ++resume_count;
+        minirpc::Scheduler::SuspendCurrent();
+        ++resume_count;
+    });
+
+    scheduler.Run();
+    scheduler.Schedule(coroutine);
+    scheduler.Schedule(coroutine);
+    scheduler.Run();
+
+    assert(resume_count == 1);
+    assert(scheduler.ready_count() == 0);
+    assert(scheduler.Contains(coroutine));
+
+    scheduler.Schedule(coroutine);
+    scheduler.Run();
+    assert(resume_count == 2);
+    assert(!scheduler.Contains(coroutine));
+}
+
+void TestFinishedCoroutinesAreReclaimed() {
+    minirpc::Scheduler scheduler;
+    for (int i = 0; i < 10000; ++i) {
+        scheduler.Spawn([] {});
+    }
+
+    scheduler.Run();
+
+    assert(scheduler.ready_count() == 0);
+    assert(scheduler.coroutine_count() == 0);
 }
 
 void TestNestedSchedulerRestoresCurrentScheduler() {
@@ -89,6 +126,8 @@ int main() {
     TestRoundRobinYield();
     TestSuspendAndExternalSchedule();
     TestFinishedCoroutineIsNotScheduled();
+    TestDuplicateScheduleOnlyResumesOnce();
+    TestFinishedCoroutinesAreReclaimed();
     TestNestedSchedulerRestoresCurrentScheduler();
     return 0;
 }

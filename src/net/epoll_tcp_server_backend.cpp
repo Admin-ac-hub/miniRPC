@@ -383,6 +383,11 @@ void EpollTcpServerBackend::AcceptConnections() {
         const int client_fd = ::accept4(
             listen_fd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (client_fd == -1) return;
+        if (options_.max_connections != 0 &&
+            connections_.size() >= options_.max_connections) {
+            ::close(client_fd);
+            continue;
+        }
 
         epoll_event event{};
         event.events = EPOLLIN | EPOLLRDHUP | EPOLLET;

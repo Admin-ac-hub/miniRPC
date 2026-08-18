@@ -10,35 +10,12 @@ option(MINIRPC_BUILD_EXAMPLES "Build miniRPC examples" ON)
 option(MINIRPC_BUILD_TESTS "Build miniRPC tests" ON)
 option(MINIRPC_BUILD_BENCHMARKS "Build miniRPC benchmarks" ON)
 
-set(MINIRPC_TCP_SERVER_BACKEND "epoll" CACHE STRING "TCP server IO backend")
-set_property(CACHE MINIRPC_TCP_SERVER_BACKEND PROPERTY STRINGS epoll io_uring)
-if(NOT MINIRPC_TCP_SERVER_BACKEND STREQUAL "epoll" AND
-   NOT MINIRPC_TCP_SERVER_BACKEND STREQUAL "io_uring")
-    message(FATAL_ERROR
-        "MINIRPC_TCP_SERVER_BACKEND must be one of: epoll, io_uring "
-        "(got '${MINIRPC_TCP_SERVER_BACKEND}')"
-    )
-endif()
-
 find_package(Threads REQUIRED)
 find_package(Protobuf REQUIRED)
 
 file(GLOB_RECURSE MINIRPC_SOURCES CONFIGURE_DEPENDS
     src/*.cpp
 )
-
-if(MINIRPC_TCP_SERVER_BACKEND STREQUAL "epoll")
-    list(FILTER MINIRPC_SOURCES EXCLUDE REGEX "/io_uring_tcp_server_backend\\.cpp$")
-    set(MINIRPC_LIBURING_VERSION "not-linked")
-else()
-    list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-    find_package(Liburing 2.0 REQUIRED)
-    if(Liburing_VERSION)
-        set(MINIRPC_LIBURING_VERSION "${Liburing_VERSION}")
-    else()
-        set(MINIRPC_LIBURING_VERSION "unknown")
-    endif()
-endif()
 
 execute_process(
     COMMAND git rev-parse --short HEAD
@@ -95,11 +72,6 @@ target_link_libraries(minirpc
     PRIVATE
         protobuf::libprotobuf
 )
-
-if(MINIRPC_TCP_SERVER_BACKEND STREQUAL "io_uring")
-    target_link_libraries(minirpc PRIVATE Liburing::Liburing)
-    target_compile_definitions(minirpc PRIVATE MINIRPC_TCP_SERVER_BACKEND_IO_URING=1)
-endif()
 
 if(MINIRPC_BUILD_EXAMPLES)
     add_executable(echo_server examples/echo_server.cpp)
@@ -197,7 +169,5 @@ if(MINIRPC_BUILD_BENCHMARKS)
     target_link_libraries(rpc_bench PRIVATE minirpc::minirpc)
     target_compile_definitions(rpc_bench PRIVATE
         MINIRPC_GIT_REVISION="${MINIRPC_GIT_REVISION}"
-        MINIRPC_LIBURING_VERSION="${MINIRPC_LIBURING_VERSION}"
-        MINIRPC_TCP_SERVER_BACKEND_NAME="${MINIRPC_TCP_SERVER_BACKEND}"
     )
 endif()

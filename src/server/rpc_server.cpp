@@ -288,37 +288,42 @@ void RpcServer::ProcessRequest(ConnectionId conn_id,
                                ProtocolFrame frame,
                                std::chrono::steady_clock::time_point start_time) {
     RpcResponse response;
-    try {
-        RpcRequest request = DecodeRequestBody(frame.request_id, frame.body);
-        if ((request.service_name == "rpc" && request.method_name == "metrics") ||
-            request.service_name == "rpc.metrics") {
-            response.request_id = request.request_id;
-            response.status_code = static_cast<int32_t>(StatusCode::kOk);
-            response.payload = MetricsText();
-        } else if (DeadlineExpired(request)) {
-            response = MakeErrorResponse(
-                request.request_id, StatusCode::kTimeout, "request deadline exceeded");
-        } else {
-            RpcHandler handler = registry_.Find(request.service_name, request.method_name);
-            if (!handler) {
-                if (!registry_.HasService(request.service_name)) {
-                    response = MakeErrorResponse(
-                        request.request_id, StatusCode::kServiceNotFound, "service not found");
-                } else {
-                    response = MakeErrorResponse(
-                        request.request_id, StatusCode::kMethodNotFound, "method not found");
-                }
-            } else {
-                response = handler(request);
+    if (frame.codec_type != CodecType::kProtobuf) {
+        response = MakeErrorResponse(
+            frame.request_id, StatusCode::kNotImplemented, "unsupported RPC codec");
+    } else {
+        try {
+            RpcRequest request = DecodeRequestBody(frame.request_id, frame.body);
+            if ((request.service_name == "rpc" && request.method_name == "metrics") ||
+                request.service_name == "rpc.metrics") {
                 response.request_id = request.request_id;
+                response.status_code = static_cast<int32_t>(StatusCode::kOk);
+                response.payload = MetricsText();
+            } else if (DeadlineExpired(request)) {
+                response = MakeErrorResponse(
+                    request.request_id, StatusCode::kTimeout, "request deadline exceeded");
+            } else {
+                RpcHandler handler = registry_.Find(request.service_name, request.method_name);
+                if (!handler) {
+                    if (!registry_.HasService(request.service_name)) {
+                        response = MakeErrorResponse(
+                            request.request_id, StatusCode::kServiceNotFound, "service not found");
+                    } else {
+                        response = MakeErrorResponse(
+                            request.request_id, StatusCode::kMethodNotFound, "method not found");
+                    }
+                } else {
+                    response = handler(request);
+                    response.request_id = request.request_id;
+                }
             }
+        } catch (const BodyCodecError& ex) {
+            response = MakeErrorResponse(frame.request_id, StatusCode::kDeserializeError, ex.what());
+        } catch (const std::exception& ex) {
+            response = MakeErrorResponse(frame.request_id, StatusCode::kServerError, ex.what());
+        } catch (...) {
+            response = MakeErrorResponse(frame.request_id, StatusCode::kServerError, "unknown server error");
         }
-    } catch (const BodyCodecError& ex) {
-        response = MakeErrorResponse(frame.request_id, StatusCode::kDeserializeError, ex.what());
-    } catch (const std::exception& ex) {
-        response = MakeErrorResponse(frame.request_id, StatusCode::kServerError, ex.what());
-    } catch (...) {
-        response = MakeErrorResponse(frame.request_id, StatusCode::kServerError, "unknown server error");
     }
     ProtocolFrame response_frame;
     const Status encode_status = PrepareResponseFrame(frame.request_id, &response, &response_frame);

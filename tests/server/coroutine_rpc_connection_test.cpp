@@ -131,10 +131,14 @@ void TestCoroutineRpcConnectionEchoAndErrors() {
 
     std::vector<minirpc::RpcResponse> responses;
     std::thread client([&] {
+        minirpc::ProtocolFrame unsupported =
+            MakeRequestFrame(4, "EchoService", "Echo", "ignored");
+        unsupported.codec_type = minirpc::CodecType::kRaw;
         responses = ClientExchange(sockets.client_fd(), {
             MakeRequestFrame(1, "EchoService", "Echo", "hello"),
             MakeRequestFrame(2, "EchoService", "Missing", ""),
             MakeRequestFrame(3, "MissingService", "Echo", ""),
+            unsupported,
         });
         sockets.CloseClient();
     });
@@ -143,7 +147,7 @@ void TestCoroutineRpcConnectionEchoAndErrors() {
     client.join();
 
     assert(server_status.ok());
-    assert(responses.size() == 3);
+    assert(responses.size() == 4);
     assert(responses[0].request_id == 1);
     assert(responses[0].status_code == static_cast<int32_t>(minirpc::StatusCode::kOk));
     assert(responses[0].payload == "hello");
@@ -151,6 +155,9 @@ void TestCoroutineRpcConnectionEchoAndErrors() {
     assert(responses[1].status_code == static_cast<int32_t>(minirpc::StatusCode::kMethodNotFound));
     assert(responses[2].request_id == 3);
     assert(responses[2].status_code == static_cast<int32_t>(minirpc::StatusCode::kServiceNotFound));
+    assert(responses[3].request_id == 4);
+    assert(responses[3].status_code == static_cast<int32_t>(minirpc::StatusCode::kNotImplemented));
+    assert(responses[3].error_message == "unsupported RPC codec");
 }
 
 void TestCoroutineRpcConnectionRejectsNonRequestFrame() {

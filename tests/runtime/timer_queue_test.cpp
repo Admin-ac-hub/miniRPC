@@ -42,12 +42,12 @@ void TestTimersExpireByDeadlineOrder() {
     minirpc::TimerQueue timers(&scheduler);
     std::vector<int> events;
 
-    minirpc::Coroutine* slow = scheduler.Spawn([&] {
+    const minirpc::CoroutineHandle slow = scheduler.Spawn([&] {
         events.push_back(1);
         assert(timers.SleepFor(30ms));
         events.push_back(4);
     });
-    minirpc::Coroutine* fast = scheduler.Spawn([&] {
+    const minirpc::CoroutineHandle fast = scheduler.Spawn([&] {
         events.push_back(2);
         assert(timers.SleepFor(5ms));
         events.push_back(3);
@@ -55,22 +55,22 @@ void TestTimersExpireByDeadlineOrder() {
 
     scheduler.Run();
     assert((events == std::vector<int>{1, 2}));
-    assert(!slow->Finished());
-    assert(!fast->Finished());
+    assert(scheduler.Contains(slow));
+    assert(scheduler.Contains(fast));
     assert(timers.size() == 2);
 
     std::this_thread::sleep_for(10ms);
     assert(timers.DrainExpired() == 1);
     scheduler.Run();
     assert((events == std::vector<int>{1, 2, 3}));
-    assert(!slow->Finished());
-    assert(fast->Finished());
+    assert(scheduler.Contains(slow));
+    assert(!scheduler.Contains(fast));
 
     std::this_thread::sleep_for(30ms);
     assert(timers.DrainExpired() == 1);
     scheduler.Run();
     assert((events == std::vector<int>{1, 2, 3, 4}));
-    assert(slow->Finished());
+    assert(!scheduler.Contains(slow));
 }
 
 void TestScheduleAfterExternalCoroutine() {
@@ -78,7 +78,7 @@ void TestScheduleAfterExternalCoroutine() {
     minirpc::TimerQueue timers(&scheduler);
     std::vector<int> events;
 
-    minirpc::Coroutine* coroutine = scheduler.Spawn([&] {
+    const minirpc::CoroutineHandle coroutine = scheduler.Spawn([&] {
         events.push_back(1);
         minirpc::Scheduler::SuspendCurrent();
         events.push_back(2);
@@ -86,7 +86,7 @@ void TestScheduleAfterExternalCoroutine() {
 
     scheduler.Run();
     assert((events == std::vector<int>{1}));
-    assert(!coroutine->Finished());
+    assert(scheduler.Contains(coroutine));
     assert(timers.ScheduleAfter(coroutine, 5ms));
     assert(timers.TimeUntilNext().has_value());
 
@@ -94,7 +94,7 @@ void TestScheduleAfterExternalCoroutine() {
     assert(timers.DrainExpired() == 1);
     scheduler.Run();
     assert((events == std::vector<int>{1, 2}));
-    assert(coroutine->Finished());
+    assert(!scheduler.Contains(coroutine));
 }
 
 void TestSleepOutsideCoroutineFails() {

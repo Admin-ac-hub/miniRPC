@@ -16,7 +16,6 @@ constexpr std::size_t kReadChunkSize = 4096;
 
 void CloseFd(int* fd) {
     if (*fd != -1) {
-        ::shutdown(*fd, SHUT_RDWR);
         ::close(*fd);
         *fd = -1;
     }
@@ -79,13 +78,21 @@ Status TcpClient::Connect(const Endpoint& endpoint) {
 void TcpClient::Close() {
     const bool was_closing = closing_.exchange(true, std::memory_order_acq_rel);
     {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        CloseFd(&fd_);
+        std::lock_guard<std::mutex> send_lock(send_mutex_);
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        if (fd_ != -1) {
+            (void)::shutdown(fd_, SHUT_RDWR);
+        }
     }
-    state_.store(ConnectionState::kDisconnected, std::memory_order_release);
     if (reader_thread_.joinable() && reader_thread_.get_id() != std::this_thread::get_id()) {
         reader_thread_.join();
     }
+    {
+        std::lock_guard<std::mutex> send_lock(send_mutex_);
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        CloseFd(&fd_);
+    }
+    state_.store(ConnectionState::kDisconnected, std::memory_order_release);
     if (!was_closing) {
         FireClose(CloseReason::kLocalClose, "");
     }
@@ -94,6 +101,9 @@ void TcpClient::Close() {
 Status TcpClient::SendFrame(const ProtocolFrame& frame) {
     const std::string data = codec_.Encode(frame);
     std::lock_guard<std::mutex> send_lock(send_mutex_);
+    if (closing_.load(std::memory_order_acquire)) {
+        return Status::Error(StatusCode::kNetworkError, "connection is closed");
+    }
     int fd = -1;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -160,10 +170,15 @@ void TcpClient::ReaderLoop() {
     }
 
     {
+        std::lock_guard<std::mutex> send_lock(send_mutex_);
         std::lock_guard<std::mutex> lock(state_mutex_);
         CloseFd(&fd_);
     }
     state_.store(ConnectionState::kDisconnected, std::memory_order_release);
+    if (closing_.load(std::memory_order_acquire)) {
+        reason = CloseReason::kLocalClose;
+        message.clear();
+    }
     FireClose(reason, message);
 }
 

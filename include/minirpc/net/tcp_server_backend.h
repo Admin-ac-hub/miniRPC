@@ -41,6 +41,5 @@ public:
 };
 
 std::unique_ptr<TcpServerBackend> MakeEpollTcpServerBackend();
-std::unique_ptr<TcpServerBackend> MakeIoUringTcpServerBackend();
 
 }  // namespace minirpc

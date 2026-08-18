@@ -10,15 +10,15 @@ permissions:
 
 jobs:
   build-and-test:
-    name: Build and test (${{ matrix.tcp_backend }})
+    name: Build and test (${{ matrix.build_type }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        tcp_backend:
-          - epoll
-          - io_uring
+        build_type:
+          - Debug
+          - Release
 
     steps:
       - name: Check out repository
@@ -28,18 +28,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes protobuf-compiler libprotobuf-dev
-          if [ "${{ matrix.tcp_backend }}" = "io_uring" ]; then
-            sudo apt-get install --yes liburing-dev
-          fi
 
       - name: Configure
         run: >-
           cmake -S . -B build
-          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           -DMINIRPC_BUILD_EXAMPLES=ON
           -DMINIRPC_BUILD_TESTS=ON
           -DMINIRPC_BUILD_BENCHMARKS=ON
-          -DMINIRPC_TCP_SERVER_BACKEND=${{ matrix.tcp_backend }}
 
       - name: Build
         run: cmake --build build --parallel

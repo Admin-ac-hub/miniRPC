@@ -1,7 +1,9 @@
+#include <atomic>
 #include <cassert>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <future>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -159,11 +161,130 @@ void TestTimerAndIoShareEventLoop() {
     assert((events == std::vector<int>{1, 2, 3, 4}));
 }
 
+void TestStopCancelsReadableWait() {
+    SocketPair sockets;
+    minirpc::CoroutineIoContext io;
+    ssize_t read_result = 0;
+    int read_error = 0;
+
+    io.Spawn([&] {
+        char byte = 0;
+        read_result = io.Read(sockets.first(), &byte, sizeof(byte));
+        read_error = errno;
+    });
+    io.Spawn([&] { io.Stop(); });
+
+    io.Run();
+
+    assert(read_result == -1);
+    assert(read_error == ECANCELED);
+    assert(io.waiting_count() == 0);
+    assert(io.scheduler().coroutine_count() == 0);
+}
+
+void TestStopCancelsTimerWait() {
+    minirpc::CoroutineIoContext io;
+    bool sleep_result = true;
+
+    io.Spawn([&] {
+        sleep_result = io.timers().SleepFor(std::chrono::hours(1));
+    });
+    io.Spawn([&] { io.Stop(); });
+
+    io.Run();
+
+    assert(!sleep_result);
+    assert(io.timers().empty());
+    assert(io.scheduler().coroutine_count() == 0);
+}
+
+void TestExternalStopWakesAndCancelsReadableWait() {
+    SocketPair sockets;
+    minirpc::CoroutineIoContext io;
+    std::promise<void> waiter_registered;
+    auto waiter_ready = waiter_registered.get_future();
+    ssize_t read_result = 0;
+    int read_error = 0;
+
+    io.Spawn([&] {
+        char byte = 0;
+        read_result = io.Read(sockets.first(), &byte, sizeof(byte));
+        read_error = errno;
+    });
+    io.Spawn([&] { waiter_registered.set_value(); });
+
+    std::thread io_thread([&] { io.Run(); });
+    assert(waiter_ready.wait_for(1s) == std::future_status::ready);
+    io.Stop();
+    io_thread.join();
+
+    assert(read_result == -1);
+    assert(read_error == ECANCELED);
+    assert(io.waiting_count() == 0);
+    assert(io.scheduler().coroutine_count() == 0);
+}
+
+void TestPostedControlRunsOnIoThread() {
+    minirpc::CoroutineIoContext io;
+    bool executed = false;
+
+    assert(io.Post([&] {
+        assert(minirpc::CoroutineIoContext::Current() == &io);
+        executed = true;
+    }));
+    io.Run();
+
+    assert(executed);
+}
+
+void TestConcurrentControlPostingDoesNotLoseWork() {
+    SocketPair sockets;
+    minirpc::CoroutineIoContext io;
+    std::promise<void> waiter_registered;
+    auto waiter_ready = waiter_registered.get_future();
+    std::atomic<int> controls_run{0};
+
+    io.Spawn([&] {
+        char byte = 0;
+        (void)io.Read(sockets.first(), &byte, sizeof(byte));
+    });
+    io.Spawn([&] { waiter_registered.set_value(); });
+
+    std::thread io_thread([&] { io.Run(); });
+    assert(waiter_ready.wait_for(1s) == std::future_status::ready);
+
+    constexpr int kPosterCount = 4;
+    constexpr int kControlsPerPoster = 250;
+    std::vector<std::thread> posters;
+    for (int i = 0; i < kPosterCount; ++i) {
+        posters.emplace_back([&] {
+            for (int j = 0; j < kControlsPerPoster; ++j) {
+                assert(io.Post([&] { controls_run.fetch_add(1); }));
+            }
+        });
+    }
+    for (auto& poster : posters) {
+        poster.join();
+    }
+
+    io.Stop();
+    io_thread.join();
+
+    assert(controls_run.load() == kPosterCount * kControlsPerPoster);
+    assert(io.waiting_count() == 0);
+    assert(io.scheduler().coroutine_count() == 0);
+}
+
 }  // namespace
 
 int main() {
     TestReadSuspendsUntilFdReadable();
     TestWriteAllSuspendsUntilFdWritable();
     TestTimerAndIoShareEventLoop();
+    TestStopCancelsReadableWait();
+    TestStopCancelsTimerWait();
+    TestExternalStopWakesAndCancelsReadableWait();
+    TestPostedControlRunsOnIoThread();
+    TestConcurrentControlPostingDoesNotLoseWork();
     return 0;
 }

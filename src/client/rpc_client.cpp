@@ -32,7 +32,10 @@ RpcClient::RpcClient(Endpoint endpoint)
 }
 
 RpcClient::~RpcClient() {
-    stopping_.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        stopping_.store(true, std::memory_order_release);
+    }
     pending_cv_.notify_all();
     Close();
     if (timeout_thread_.joinable()) {

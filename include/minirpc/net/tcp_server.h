@@ -15,6 +15,7 @@ namespace minirpc {
 class TcpServerInternalAccess;
 
 struct TcpServerOptions {
+    std::size_t max_connections        = 10000;
     std::size_t max_read_buffer_bytes  = 2 * 1024 * 1024;
     std::size_t max_write_buffer_bytes = 16 * 1024 * 1024;
     std::size_t high_watermark_bytes   = 1024 * 1024;

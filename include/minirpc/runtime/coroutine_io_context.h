@@ -25,8 +25,9 @@ public:
     CoroutineIoContext(const CoroutineIoContext&) = delete;
     CoroutineIoContext& operator=(const CoroutineIoContext&) = delete;
 
-    Coroutine* Spawn(Task task);
-    void Schedule(Coroutine* coroutine);
+    CoroutineHandle Spawn(Task task);
+    void Schedule(CoroutineHandle coroutine);
+    bool Post(Task task);
     void Run();
     void Stop() noexcept;
     void AddExternalWait() noexcept;
@@ -41,6 +42,9 @@ public:
     TimerQueue& timers() noexcept;
 
     std::size_t waiting_count() const noexcept;
+    bool valid() const noexcept;
+    int initialization_error() const noexcept;
+    int run_error() const noexcept;
 
     static CoroutineIoContext* Current() noexcept;
 
@@ -51,16 +55,17 @@ private:
     };
 
     struct FdWaiters {
-        Coroutine* read = nullptr;
-        Coroutine* write = nullptr;
+        CoroutineHandle read;
+        CoroutineHandle write;
         bool registered = false;
     };
 
     bool WaitFd(int fd, WaitKind kind);
     void WakeFd(int fd, std::uint32_t events);
+    void CancelAllWaiters();
     bool UpdateInterest(int fd, FdWaiters* waiters);
     void DrainWake();
-    void DrainPendingReady();
+    void DrainControls();
     void Wake();
     bool HasPendingWork() const;
     int NextPollTimeoutMs() const;
@@ -69,11 +74,13 @@ private:
     TimerQueue timers_;
     int epoll_fd_;
     int wake_fd_;
+    int initialization_error_;
+    std::atomic<int> run_error_;
     std::atomic<bool> stopping_;
     std::atomic<std::size_t> external_waits_;
     std::unordered_map<int, FdWaiters> waiters_;
-    mutable std::mutex pending_mutex_;
-    std::vector<Coroutine*> pending_ready_;
+    mutable std::mutex control_mutex_;
+    std::vector<Task> pending_controls_;
 };
 
 }  // namespace minirpc

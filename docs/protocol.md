@@ -10,37 +10,15 @@
 
 - `magic`：固定为 `0x4d525043`，对应 `MRPC`。
 - `version`：当前为 `1`。
-- `msg_type`：请求、响应或心跳。
-- `codec`：包体序列化格式。
+- `msg_type`：请求、响应，以及为后续兼容保留的心跳枚举值；当前 RPC 主链路只处理请求和响应。
+- `codec`：包体编码标识。RPC 主链路当前只支持 `kProtobuf`；`kRaw` 和 `kJson` 保留给低层帧使用或后续兼容。
 - `request_id`：请求响应匹配 ID。
 - `body_size`：包体长度。
 - `body`：序列化后的请求或响应内容。
 
 编解码实现位于 `include/minirpc/protocol` 和 `src/protocol`。
 
-## RPC Body
-
-协议帧的 `body` 由 `body_codec` 编码。
-
-请求 body：
-
-```text
-| service_name_len:4 | service_name |
-| method_name_len:4  | method_name  |
-| payload_len:4      | payload      |
-```
-
-响应 body：
-
-```text
-| status_code:4      |
-| error_len:4        | error_message |
-| payload_len:4      | payload       |
-```
-
-所有长度和整数都使用大端序。`payload` 按 `std::string` 原样传输，允许二进制内容。
-
-## Protobuf Body Format
+## Protobuf RPC Body
 
 当 `codec = 2`（kProtobuf）时，body 使用 Protocol Buffers (proto3) 序列化。
 
@@ -65,4 +43,4 @@ bytes  payload       = 3;
 
 proto 定义文件：`proto/minirpc_body.proto`
 
-客户端默认使用 protobuf 编码，服务端根据帧头中的 `codec` 字段自动解码并返回 protobuf 响应。
+客户端使用 Protobuf 编码。服务端收到非 `kProtobuf` RPC 请求时返回 `kNotImplemented`，响应 body 仍使用 Protobuf；低层 `TcpServer` 可以继续收发其它合法 frame codec。

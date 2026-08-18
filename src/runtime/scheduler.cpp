@@ -12,23 +12,26 @@ thread_local Scheduler* t_current_scheduler = nullptr;
 Scheduler::Scheduler(std::size_t default_stack_size)
     : default_stack_size_(default_stack_size == 0 ? kDefaultCoroutineStackSize : default_stack_size),
       running_(nullptr),
-      requeue_running_(false) {}
+      requeue_running_(false),
+      next_coroutine_id_(1) {}
 
 Scheduler::~Scheduler() = default;
 
-Coroutine* Scheduler::Spawn(Task task) {
+CoroutineHandle Scheduler::Spawn(Task task) {
+    const CoroutineHandle handle{next_coroutine_id_++, 1};
     auto coroutine = std::make_unique<Coroutine>(std::move(task), default_stack_size_);
-    Coroutine* raw = coroutine.get();
-    coroutines_.push_back(std::move(coroutine));
-    ready_.push_back(raw);
-    return raw;
+    coroutine->SetHandle(handle);
+    coroutines_.emplace(handle.id, std::move(coroutine));
+    Enqueue(handle);
+    return handle;
 }
 
-void Scheduler::Schedule(Coroutine* coroutine) {
+void Scheduler::Schedule(CoroutineHandle handle) {
+    Coroutine* coroutine = Resolve(handle);
     if (coroutine == nullptr || coroutine->Finished()) {
         return;
     }
-    ready_.push_back(coroutine);
+    Enqueue(handle);
 }
 
 void Scheduler::Run() {
@@ -36,8 +39,10 @@ void Scheduler::Run() {
     t_current_scheduler = this;
 
     while (!ready_.empty()) {
-        Coroutine* coroutine = ready_.front();
+        const CoroutineHandle handle = ready_.front();
         ready_.pop_front();
+        ready_ids_.erase(handle.id);
+        Coroutine* coroutine = Resolve(handle);
         if (coroutine == nullptr || coroutine->Finished()) {
             continue;
         }
@@ -46,12 +51,13 @@ void Scheduler::Run() {
         requeue_running_ = false;
         coroutine->Resume();
         if (!coroutine->Finished() && requeue_running_) {
-            ready_.push_back(coroutine);
+            Enqueue(handle);
         }
         running_ = nullptr;
         requeue_running_ = false;
     }
 
+    ReapFinished();
     t_current_scheduler = previous;
 }
 
@@ -61,6 +67,10 @@ std::size_t Scheduler::ready_count() const noexcept {
 
 std::size_t Scheduler::coroutine_count() const noexcept {
     return coroutines_.size();
+}
+
+bool Scheduler::Contains(CoroutineHandle handle) const noexcept {
+    return Resolve(handle) != nullptr;
 }
 
 Scheduler* Scheduler::Current() noexcept {
@@ -88,6 +98,46 @@ void Scheduler::SuspendCurrent() noexcept {
     Coroutine* coroutine = Coroutine::Current();
     if (coroutine != nullptr) {
         coroutine->Yield();
+    }
+}
+
+Coroutine* Scheduler::Resolve(CoroutineHandle handle) noexcept {
+    if (!handle) {
+        return nullptr;
+    }
+    auto it = coroutines_.find(handle.id);
+    if (it == coroutines_.end() || it->second->handle() != handle) {
+        return nullptr;
+    }
+    return it->second.get();
+}
+
+const Coroutine* Scheduler::Resolve(CoroutineHandle handle) const noexcept {
+    if (!handle) {
+        return nullptr;
+    }
+    auto it = coroutines_.find(handle.id);
+    if (it == coroutines_.end() || it->second->handle() != handle) {
+        return nullptr;
+    }
+    return it->second.get();
+}
+
+void Scheduler::Enqueue(CoroutineHandle handle) {
+    if (!handle || !ready_ids_.insert(handle.id).second) {
+        return;
+    }
+    ready_.push_back(handle);
+}
+
+void Scheduler::ReapFinished() {
+    for (auto it = coroutines_.begin(); it != coroutines_.end();) {
+        if (it->second->Finished()) {
+            ready_ids_.erase(it->first);
+            it = coroutines_.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <optional>
 #include <queue>
+#include <unordered_set>
 #include <vector>
 
 #include "minirpc/runtime/coroutine.h"
@@ -25,12 +26,13 @@ public:
 
     void SetScheduler(Scheduler* scheduler) noexcept;
 
-    bool ScheduleAt(Coroutine* coroutine, TimePoint deadline);
-    bool ScheduleAfter(Coroutine* coroutine, Duration delay);
+    bool ScheduleAt(CoroutineHandle coroutine, TimePoint deadline);
+    bool ScheduleAfter(CoroutineHandle coroutine, Duration delay);
     bool SleepFor(Duration delay);
     bool SleepUntil(TimePoint deadline);
 
     std::size_t DrainExpired(TimePoint now = Clock::now());
+    std::size_t CancelAll();
     std::optional<Duration> TimeUntilNext(TimePoint now = Clock::now()) const;
     std::size_t size() const noexcept;
     bool empty() const noexcept;
@@ -39,7 +41,7 @@ private:
     struct Timer {
         TimePoint deadline;
         std::uint64_t sequence;
-        Coroutine* coroutine;
+        CoroutineHandle coroutine;
     };
 
     struct LaterDeadline {
@@ -51,6 +53,9 @@ private:
     Scheduler* scheduler_;
     std::uint64_t next_sequence_;
     std::priority_queue<Timer, std::vector<Timer>, LaterDeadline> timers_;
+    std::unordered_set<std::uint64_t> sleeping_;
+    std::unordered_set<std::uint64_t> cancelled_;
+    bool stopped_ = false;
 };
 
 }  // namespace minirpc
