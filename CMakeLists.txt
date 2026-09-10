@@ -96,6 +96,11 @@ if(MINIRPC_BUILD_TESTS)
     add_test(NAME tcp_server_test COMMAND tcp_server_test)
     list(APPEND MINIRPC_TEST_TARGETS tcp_server_test)
 
+    add_executable(tcp_idle_timeout_test tests/net/tcp_idle_timeout_test.cpp)
+    target_link_libraries(tcp_idle_timeout_test PRIVATE minirpc::minirpc)
+    add_test(NAME tcp_idle_timeout_test COMMAND tcp_idle_timeout_test)
+    list(APPEND MINIRPC_TEST_TARGETS tcp_idle_timeout_test)
+
     add_executable(tcp_client_test tests/net/tcp_client_test.cpp)
     target_link_libraries(tcp_client_test PRIVATE minirpc::minirpc)
     add_test(NAME tcp_client_test COMMAND tcp_client_test)

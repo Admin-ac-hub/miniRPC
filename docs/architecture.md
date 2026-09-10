@@ -42,6 +42,8 @@ TcpServer facade
 
 资源边界由 `TcpServerOptions` 统一配置：`max_connections` 限制同时接入的连接数，读写缓冲和跨线程响应队列均有硬上限，高低水位只暂停发生背压的连接。`max_connections = 0` 表示不限制连接数。
 
+空闲连接由 `idle_timeout_ms` 控制：连接超过该时长没有成功读写（含 accept、收到字节、写出字节，背压中的连接照常计时）即被服务端关闭并立即释放连接配额；`0` 表示禁用（默认，保持既有行为）。实现是最小堆 + 惰性删除：每个连接在堆中至多一个 pending 定时器项，`epoll_wait` 超时取 `min(1000ms, 最近到期)`，项到期时若连接已关闭或 `generation`/`activity_seq` 不匹配则直接丢弃或按最新活跃时间重推，不会误关活跃连接。
+
 `RpcServer` 的 pending request 生命周期从请求准入持续到响应整帧被内核发送接口接受。后端私有 write-completion callback 在完整发送、连接关闭、取消、队列清理或 hard stop 时恰好完成一次，graceful shutdown 据此等待真实的响应写入进度，而不是只等待 handler 返回或 response 入队。这个完成点不是应用层 ACK，不保证对端业务代码已经读取响应。
 
 公共 `TcpServer::SendFrame()` 签名和入队语义保持不变；只有 `RpcServer` 使用内部 completion 路径。epoll 在 `send(2)` 消耗整帧后成功。Running -> Draining 的状态切换、请求/拒绝响应的 pending 登记以及最终 drain seal 使用同一同步边界，避免 Stop 观察到零后又登记待写响应。

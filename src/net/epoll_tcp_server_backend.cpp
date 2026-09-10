@@ -2,10 +2,12 @@
 
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <queue>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -99,6 +101,26 @@ private:
         std::size_t write_buffer_bytes = 0;
         bool closing = false;
         bool in_backpressure = false;
+        // 仅 idle_timeout_ms > 0 时有意义。
+        std::chrono::steady_clock::time_point last_activity;
+        uint64_t activity_seq = 0;
+        bool timer_pending = false;
+    };
+
+    // 空闲超时提醒项：堆中每个连接至多一个 pending 项，Touch 只推进
+    // last_activity/activity_seq，项到期时若已过期则按最新活跃时间重推，
+    // 保证堆大小上界为连接数而不是 Touch 次数。
+    struct IdleTimer {
+        std::chrono::steady_clock::time_point deadline;
+        ConnectionId conn_id = 0;
+        uint64_t generation = 0;
+        uint64_t activity_seq = 0;
+    };
+
+    struct LaterDeadline {
+        bool operator()(const IdleTimer& lhs, const IdleTimer& rhs) const {
+            return lhs.deadline > rhs.deadline;
+        }
     };
 
     struct QueuedResponse {
@@ -122,6 +144,9 @@ private:
     void DrainResponses();
     void DrainCloseRequests();
     void DrainWakeEvents();
+    void TouchConnection(Connection& conn);
+    int NextIdleTimeoutMs() const;
+    void DrainIdleTimers();
     void WakeEventLoop();
     void CloseListenFd();
     void CloseAllConnections();
@@ -163,6 +188,7 @@ private:
     std::mutex wake_mutex_;
     std::vector<QueuedResponse> response_queue_;
     std::vector<QueuedClose> close_queue_;
+    std::priority_queue<IdleTimer, std::vector<IdleTimer>, LaterDeadline> idle_timers_;
 };
 
 EpollTcpServerBackend::EpollTcpServerBackend()
@@ -229,6 +255,7 @@ void EpollTcpServerBackend::Stop() {
 void EpollTcpServerBackend::CleanupAfterJoin() {
     CloseListenFd();
     CloseAllConnections();
+    idle_timers_ = {};
     FailQueuedResponses("TcpServer stopped before response was sent");
     CloseFd(&epoll_fd_);
     {
@@ -347,7 +374,7 @@ void EpollTcpServerBackend::RunEventLoop() {
         if (!accepting_.load(std::memory_order_acquire)) {
             CloseListenFd();
         }
-        const int ready = ::epoll_wait(epoll_fd_, events, kMaxEvents, 1000);
+        const int ready = ::epoll_wait(epoll_fd_, events, kMaxEvents, NextIdleTimeoutMs());
         if (ready == -1) {
             if (errno == EINTR) continue;
             running_.store(false, std::memory_order_release);
@@ -369,6 +396,7 @@ void EpollTcpServerBackend::RunEventLoop() {
             }
         }
         DrainResponses();
+        DrainIdleTimers();
     }
     DrainResponses();
     accepting_.store(false, std::memory_order_release);
@@ -404,6 +432,7 @@ void EpollTcpServerBackend::AcceptConnections() {
         conn.generation = gen;
         connection_by_fd_[client_fd] = id;
         connections_[id] = std::move(conn);
+        TouchConnection(connections_[id]);
         if (on_open_) on_open_(id, gen);
     }
 }
@@ -437,6 +466,7 @@ void EpollTcpServerBackend::HandleClientRead(int client_fd) {
         const ssize_t n = ::recv(client_fd, temp, sizeof(temp), 0);
         if (n > 0) {
             conn->read_buffer.append(temp, static_cast<std::size_t>(n));
+            TouchConnection(*conn);
 
             while (true) {
                 ProtocolFrame frame;
@@ -524,6 +554,52 @@ void EpollTcpServerBackend::DrainWakeEvents() {
     }
 }
 
+void EpollTcpServerBackend::TouchConnection(Connection& conn) {
+    if (options_.idle_timeout_ms <= std::chrono::milliseconds(0)) return;
+    conn.last_activity = std::chrono::steady_clock::now();
+    ++conn.activity_seq;
+    if (conn.timer_pending) return;
+    idle_timers_.push(IdleTimer{conn.last_activity + options_.idle_timeout_ms,
+                                conn.id,
+                                conn.generation,
+                                conn.activity_seq});
+    conn.timer_pending = true;
+}
+
+int EpollTcpServerBackend::NextIdleTimeoutMs() const {
+    if (idle_timers_.empty()) return 1000;
+    const auto now = std::chrono::steady_clock::now();
+    if (idle_timers_.top().deadline <= now) return 0;
+    const auto remaining =
+        std::chrono::ceil<std::chrono::milliseconds>(idle_timers_.top().deadline - now);
+    if (remaining.count() <= 0) return 0;
+    if (remaining.count() > 1000) return 1000;
+    return static_cast<int>(remaining.count());
+}
+
+void EpollTcpServerBackend::DrainIdleTimers() {
+    if (idle_timers_.empty()) return;
+    const auto now = std::chrono::steady_clock::now();
+    while (!idle_timers_.empty() && idle_timers_.top().deadline <= now) {
+        const IdleTimer timer = idle_timers_.top();
+        idle_timers_.pop();
+        Connection* conn = FindById(timer.conn_id);
+        if (conn == nullptr || conn->generation != timer.generation) continue;
+        if (timer.activity_seq != conn->activity_seq) {
+            // 项过期但连接此后又活跃过：按最新活跃时间重新排队。
+            idle_timers_.push(IdleTimer{conn->last_activity + options_.idle_timeout_ms,
+                                        conn->id,
+                                        conn->generation,
+                                        conn->activity_seq});
+            continue;
+        }
+        std::ostringstream message;
+        message << "idle timeout fd=" << conn->fd << " conn_id=" << conn->id;
+        Logger::Log(LogLevel::kInfo, message.str());
+        CloseById(timer.conn_id);
+    }
+}
+
 void EpollTcpServerBackend::WakeEventLoop() {
     std::lock_guard<std::mutex> lock(wake_mutex_);
     if (wake_fd_ == -1) return;
@@ -580,6 +656,7 @@ bool EpollTcpServerBackend::SendToConnection(Connection& conn, PendingWrite&& wr
     }
     const SendResult sent = SendAll(conn.fd, write.data.data(), write.data.size());
     if (sent.status == SendStatus::kOk) {
+        TouchConnection(conn);
         CompleteWrite(&write.completion, Status::Ok());
         return true;
     }
@@ -590,6 +667,7 @@ bool EpollTcpServerBackend::SendToConnection(Connection& conn, PendingWrite&& wr
         return false;
     }
     write.offset = sent.sent;
+    if (sent.sent > 0) TouchConnection(conn);
     QueueWriteBuffer(conn, std::move(write));
     if (conn.write_buffer_bytes > options_.max_write_buffer_bytes) return false;
     if (!UpdateInterest(conn, true)) return false;
@@ -614,6 +692,7 @@ void EpollTcpServerBackend::FlushWriteBuffer(int client_fd) {
         }
 
         conn->write_buffer_bytes -= sent.sent;
+        if (sent.sent > 0) TouchConnection(*conn);
         if (sent.status == SendStatus::kWouldBlock) {
             front.offset += sent.sent;
             if (!MaybeLeaveBackpressure(*conn)) return;

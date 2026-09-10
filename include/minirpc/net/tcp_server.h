@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -22,6 +23,8 @@ struct TcpServerOptions {
     std::size_t low_watermark_bytes    = 256 * 1024;
     std::size_t max_response_queue     = 10000;
     int backlog                        = 128;
+    // 连接无成功读写超过该时长即被服务端关闭；0 = 禁用（默认，保持既有行为）。
+    std::chrono::milliseconds idle_timeout_ms{0};
 };
 
 class TcpServer {

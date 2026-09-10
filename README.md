@@ -166,6 +166,5 @@ docs/              架构、协议与性能文档
 ## 当前限制
 
 - benchmark 目前是同进程闭环模型，尚未隔离服务端 CPU、内存和网络开销。
-- 稳定 Reactor 路径尚未提供连接空闲超时。
 - CoroutineRpcServer 尚未提供连接空闲、读写超时和最大连接数配置，因此继续作为实验路径。
 - 不包含服务发现、TLS、HTTP gateway 或分布式 tracing。
