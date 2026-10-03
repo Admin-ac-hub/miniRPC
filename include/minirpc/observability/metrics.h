@@ -5,7 +5,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <mutex>
 #include <string>
 
 namespace minirpc {
@@ -29,6 +28,7 @@ struct RpcMetricsSnapshot {
     uint64_t server_state = 2;
     uint64_t shutdown_start_time_ms = 0;
     uint64_t graceful_shutdown_timeout_count = 0;
+    uint64_t protocol_error_total = 0;
 };
 
 class RpcMetrics {
@@ -39,6 +39,7 @@ public:
     void RecordFailure();
     void RecordTimeout();
     void RecordRejected();
+    void RecordProtocolError();
     void RecordLatency(std::chrono::nanoseconds latency);
     void IncrementActiveConnections();
     void DecrementActiveConnections();
@@ -58,6 +59,7 @@ public:
     uint64_t failed_requests() const;
     uint64_t timeout_requests() const;
     uint64_t rejected_requests() const;
+    uint64_t protocol_error_total() const;
     uint64_t pending_requests() const;
     uint64_t latency_samples() const;
     uint64_t avg_latency_us() const;
@@ -74,6 +76,7 @@ public:
 
 private:
     static constexpr std::size_t kLatencySampleCapacity = 10000;
+    static constexpr std::size_t kLatencyShardCount = 8;
 
     struct LatencyPercentiles {
         uint64_t p50_us = 0;
@@ -81,7 +84,15 @@ private:
         uint64_t p99_us = 0;
     };
 
-    uint64_t PercentileLatencyUs(double percentile) const;
+    struct LatencySample {
+        std::atomic<uint64_t> encoded_us{0};
+    };
+
+    struct alignas(64) LatencyShard {
+        std::atomic<uint64_t> samples{0};
+        std::atomic<uint64_t> ns{0};
+    };
+
     LatencyPercentiles CalculateLatencyPercentilesUs() const;
 
     std::atomic<uint64_t> active_connections_{0};
@@ -91,18 +102,15 @@ private:
     std::atomic<uint64_t> failed_requests_{0};
     std::atomic<uint64_t> timeout_requests_{0};
     std::atomic<uint64_t> rejected_requests_{0};
+    std::atomic<uint64_t> protocol_error_total_{0};
     std::atomic<uint64_t> pending_requests_{0};
-    std::atomic<uint64_t> latency_samples_{0};
-    std::atomic<uint64_t> total_latency_ns_{0};
+    std::array<LatencyShard, kLatencyShardCount> latency_shards_{};
     std::atomic<uint64_t> backpressure_connections_{0};
     std::atomic<uint64_t> max_write_buffer_size_{0};
     std::atomic<uint64_t> server_state_{2};
     std::atomic<uint64_t> shutdown_start_time_ms_{0};
     std::atomic<uint64_t> graceful_shutdown_timeout_count_{0};
-    mutable std::mutex latency_mutex_;
-    std::array<uint64_t, kLatencySampleCapacity> latency_ring_us_{};
-    std::size_t latency_write_index_ = 0;
-    std::size_t latency_sample_count_ = 0;
+    std::array<LatencySample, kLatencySampleCapacity> latency_ring_{};
 };
 
 }  // namespace minirpc

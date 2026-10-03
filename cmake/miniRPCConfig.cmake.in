@@ -1,0 +1,12 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# minirpc 是静态库且 PRIVATE 链接 protobuf，导出接口里含
+# $<LINK_ONLY:protobuf::libprotobuf>，使用者必须能解析该 target。
+find_dependency(Threads)
+find_dependency(Protobuf)
+
+include("${CMAKE_CURRENT_LIST_DIR}/miniRPCTargets.cmake")
+
+check_required_components(miniRPC)

@@ -52,17 +52,27 @@ void RpcMetrics::RecordRejected() {
     RecordFailure();
 }
 
+void RpcMetrics::RecordProtocolError() {
+    protocol_error_total_.fetch_add(1, std::memory_order_relaxed);
+}
+
 void RpcMetrics::RecordLatency(std::chrono::nanoseconds latency) {
+    // Cache only a shard number so thread reuse cannot retain a destroyed metrics object.
+    static std::atomic<std::size_t> next_shard{0};
+    thread_local const std::size_t shard =
+        next_shard.fetch_add(1, std::memory_order_relaxed) % kLatencyShardCount;
     const auto clamped = std::max<std::chrono::nanoseconds>(latency, std::chrono::nanoseconds::zero());
-    latency_samples_.fetch_add(1, std::memory_order_relaxed);
-    total_latency_ns_.fetch_add(static_cast<uint64_t>(clamped.count()), std::memory_order_relaxed);
+    const uint64_t index = latency_shards_[shard].samples.fetch_add(1, std::memory_order_relaxed);
+    latency_shards_[shard].ns.fetch_add(static_cast<uint64_t>(clamped.count()),
+                                       std::memory_order_relaxed);
     const uint64_t latency_us = static_cast<uint64_t>(clamped.count() / 1000);
-    std::lock_guard<std::mutex> lock(latency_mutex_);
-    latency_ring_us_[latency_write_index_] = latency_us;
-    latency_write_index_ = (latency_write_index_ + 1) % latency_ring_us_.size();
-    if (latency_sample_count_ < latency_ring_us_.size()) {
-        ++latency_sample_count_;
-    }
+    // Zero marks an unused slot; zero-duration samples are stored as one.
+    // A coprime stride spreads writes while each shard still visits every slot.
+    const std::size_t slot = ((index % latency_ring_.size()) * 17 +
+                              shard * (kLatencySampleCapacity / kLatencyShardCount)) %
+                             latency_ring_.size();
+    latency_ring_[slot].encoded_us.store(
+        latency_us + 1, std::memory_order_relaxed);
 }
 
 void RpcMetrics::IncrementActiveConnections() {
@@ -138,33 +148,44 @@ uint64_t RpcMetrics::rejected_requests() const {
     return rejected_requests_.load(std::memory_order_relaxed);
 }
 
+uint64_t RpcMetrics::protocol_error_total() const {
+    return protocol_error_total_.load(std::memory_order_relaxed);
+}
+
 uint64_t RpcMetrics::pending_requests() const {
     return pending_requests_.load(std::memory_order_relaxed);
 }
 
 uint64_t RpcMetrics::latency_samples() const {
-    return latency_samples_.load(std::memory_order_relaxed);
+    uint64_t samples = 0;
+    for (const auto& total : latency_shards_) {
+        samples += total.samples.load(std::memory_order_relaxed);
+    }
+    return samples;
 }
 
 uint64_t RpcMetrics::avg_latency_us() const {
-    const uint64_t samples = latency_samples_.load(std::memory_order_relaxed);
+    const uint64_t samples = latency_samples();
     if (samples == 0) {
         return 0;
     }
-    const uint64_t total_ns = total_latency_ns_.load(std::memory_order_relaxed);
+    uint64_t total_ns = 0;
+    for (const auto& total : latency_shards_) {
+        total_ns += total.ns.load(std::memory_order_relaxed);
+    }
     return total_ns / samples / 1000;
 }
 
 uint64_t RpcMetrics::p50_latency_us() const {
-    return PercentileLatencyUs(0.50);
+    return CalculateLatencyPercentilesUs().p50_us;
 }
 
 uint64_t RpcMetrics::p95_latency_us() const {
-    return PercentileLatencyUs(0.95);
+    return CalculateLatencyPercentilesUs().p95_us;
 }
 
 uint64_t RpcMetrics::p99_latency_us() const {
-    return PercentileLatencyUs(0.99);
+    return CalculateLatencyPercentilesUs().p99_us;
 }
 
 uint64_t RpcMetrics::backpressure_connections() const {
@@ -196,6 +217,7 @@ RpcMetricsSnapshot RpcMetrics::Snapshot() const {
     snapshot.failed_requests = failed_requests();
     snapshot.timeout_requests = timeout_requests();
     snapshot.rejected_requests = rejected_requests();
+    snapshot.protocol_error_total = protocol_error_total();
     snapshot.pending_requests = pending_requests();
     snapshot.latency_samples = latency_samples();
     snapshot.avg_latency_us = avg_latency_us();
@@ -228,6 +250,8 @@ std::string RpcMetrics::ToPrometheusText(std::size_t threadpool_queue_size) cons
     out << "minirpc_timeout_requests_total " << snapshot.timeout_requests << '\n';
     out << "# TYPE minirpc_rejected_requests_total counter\n";
     out << "minirpc_rejected_requests_total " << snapshot.rejected_requests << '\n';
+    out << "# TYPE minirpc_protocol_error_total counter\n";
+    out << "minirpc_protocol_error_total " << snapshot.protocol_error_total << '\n';
     out << "# TYPE minirpc_pending_requests gauge\n";
     out << "minirpc_pending_requests " << snapshot.pending_requests << '\n';
     out << "# TYPE minirpc_latency_samples_total counter\n";
@@ -258,21 +282,13 @@ std::string RpcMetrics::ToPrometheusText(std::size_t threadpool_queue_size) cons
     return out.str();
 }
 
-uint64_t RpcMetrics::PercentileLatencyUs(double percentile) const {
-    std::vector<uint64_t> samples;
-    {
-        std::lock_guard<std::mutex> lock(latency_mutex_);
-        samples.assign(latency_ring_us_.begin(), latency_ring_us_.begin() + latency_sample_count_);
-    }
-    std::sort(samples.begin(), samples.end());
-    return PercentileFromSortedSamples(samples, percentile);
-}
-
 RpcMetrics::LatencyPercentiles RpcMetrics::CalculateLatencyPercentilesUs() const {
     std::vector<uint64_t> samples;
-    {
-        std::lock_guard<std::mutex> lock(latency_mutex_);
-        samples.assign(latency_ring_us_.begin(), latency_ring_us_.begin() + latency_sample_count_);
+    samples.reserve(latency_ring_.size());
+    // Slots are independent: concurrent writes produce a best-effort recent window.
+    for (const auto& slot : latency_ring_) {
+        const uint64_t encoded = slot.encoded_us.load(std::memory_order_relaxed);
+        if (encoded != 0) samples.push_back(encoded - 1);
     }
     std::sort(samples.begin(), samples.end());
 

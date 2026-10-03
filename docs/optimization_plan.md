@@ -3,8 +3,8 @@
 > 按优先级排。每项都遵守 `AGENTS.md`：不引入新依赖、先补能复现的失败用例再改实现、
 > 涉及 epoll 的测试在 docker 容器 `minirpc-linux` 里跑、路径镜像、CMake 显式 `add_test`。
 >
-> ⚠️ **需要先和你确认的公共 API 变更**：P0 要给 `TcpServerOptions` 加字段。
-> 按 `AGENTS.md` §1，公共 API 调整需先确认再动手。默认值为「禁用」可保证向后兼容。
+> 进度：P0 已完成；本轮按计划落实 P1 配置一致性与 P2 客户端接收预算。
+> P1/P2 的配置入口只增加在低层 TCP，`RpcClient` / `RpcServer` 的公共接口不变。
 
 ---
 
@@ -148,28 +148,43 @@ struct TcpServerOptions {
 
 ## P1 — 配置一致性：16MB vs 2MB
 
-**问题**：协议层 `kDefaultMaxFrameBodySize = 16MB`，连接层 `max_read_buffer_bytes = 2MB`。
-默认配置下**实际能收的最大帧约 2MB**，与协议宣称的 16MB 不符（详见对话分析）。
+**问题**：协议层默认 body 上限为 16 MiB，连接层默认读缓冲为 2 MiB。
+原实现只在 `kNeedMoreData` 时检查缓冲，可能继续等待无法完整接收的 body；
+超出预算的完整帧是否放行还受最后一次 `recv` 分段影响。
 
-**方案**（三选一，倾向第 2 个）：
-1. 把 `max_read_buffer_bytes` 默认改成 ≥16MB（代价：慢速攻击窗口变大）
-2. **让 `RpcCodec` 的 `max_body_size` 可配置，并校验 `max_read_buffer_bytes >= max_body_size + 20`**，
-   不一致时 `Start()` 返回明确错误（推荐，把隐式耦合变成显式校验）
-3. 文档写清两者关系
+**已实现**：复用 `RpcCodec` 已有的 `max_body_size` 构造参数，给
+`TcpServerOptions` 末尾追加 `max_frame_body_size`，默认 2 MiB − 20 字节。
+`Start()` 在监听前校验 body 不超过 16 MiB，且读缓冲能容纳固定头和最大 body，
+失败返回 `kServerError`，修正配置后可以重试。校验使用减法避免大小相加溢出。
 
-**工作量**：小。**风险**：改 `TcpServerOptions`，属 API 变更。
+每次 `recv` 按剩余缓冲预算读取，完整帧先解码释放预算，半包满预算仍不能解码则关闭。
+帧头声明 body 超限时立即拒绝；合法粘包、恰好达到上限的整帧和重新配置后的重启均有回归覆盖。
 
 ---
 
 ## P2 — 客户端读缓冲上限（补齐不对称）
 
-**问题**：`src/net/tcp_client.cpp:128` 的 `std::string buffer` **无任何大小限制**，
-只有 codec 的 16MB 声明校验。服务端若声明 15MB 并慢速发送，客户端内存无限涨。
+**问题**：客户端只有 codec 的 16 MiB body 声明校验，没有独立的接收预算。
+原文“15MB 慢速发送使内存无限涨”不准确：单连接未解码数据仍受 codec 上限约束，
+实际缺陷是不能配置更小的预算，也无法按该预算提前拒绝大包。
 
-**方案**：给 `TcpClient` 加 `max_read_buffer_bytes` 选项（默认 2MB，与服务端对称），
-`kNeedMoreData` 时超限 → `CloseReason::kProtocolError` + 断连。
+**已实现**：增加 `TcpClientOptions::max_read_buffer_bytes`（默认 2 MiB）和
+`TcpClient(options)` 构造重载，保留原默认构造入口。配置在对象生命期内不变，
+`Connect()` 拒绝小于固定头的预算；有效 body 上限取协议上限与预算减 20 的较小值。
+读循环按剩余预算读取，先解码完整帧，超限声明或满缓冲半包触发
+`CloseReason::kProtocolError` 并断连，错误信息非空且关闭回调只触发一次。
 
-**工作量**：小。
+覆盖默认预算、自定义预算、零/不足固定头的非法配置、边界整帧、半包/粘包、
+超限后重连以及 `RpcClient` 的全部 pending 请求主动失败。
+默认 `RpcClient` 的最大响应整帧因此收紧到 2 MiB；更大预算目前通过低层 `TcpClient` 配置。
+
+**P1/P2 验证（2026-09-13，`minirpc-linux`）**：
+
+- [x] 先加入两端“只发送超预算帧头”的用例，在旧实现中分别复现失败，再修实现。
+- [x] Release（`build`）全量 15/15 通过。
+- [x] Debug（`build-debug`）全量 15/15 通过。
+- [x] ASan/UBSan（`build-asan`）全量 15/15 通过。
+- [x] README、architecture 和 protocol 文档同步默认预算与配置方法。
 
 ---
 
@@ -189,12 +204,52 @@ struct TcpServerOptions {
 
 ## P4 — `codec` 的 `buffer.erase(0, n)` 是 O(n)
 
-**问题**：每解一帧都要把剩余数据整体前移，大 buffer + 高频下是可观的拷贝。
+**问题**：每解一帧都要把剩余数据整体前移。一次 recv 收到 m 帧时，总搬移量
+≈ `N·m/2`（N 为 buffer 字节数，f 为平均帧长，m ≈ N/f），即 O(N²/f)。
+粘包越深放大越狠：4KB 一次读入、36 字节小帧（m≈113）时，搬移占解码耗时的 82%。
 
-**方案**：`read_buffer` 换成 **ring buffer**，或维护 `read_index_`、延迟 compact
-（当 `read_index_ > buffer.size()/2` 时才真正 compact）。
+**量化**（2026-10-02，`benchmark/pipeline_bench.cpp --mode codec`，body=16、frame=36B、
+每档 1000 轮 × 5 次取中位数，进程已预热）：
+
+| frames | buffer_bytes | ns/frame | 其中搬移 | 搬移占比 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 36 | 6.0 | ~0 | — |
+| 4 | 144 | 5.9 | ~0 | — |
+| 8 | 288 | 7.3 | 1.3 | 18% |
+| 16 | 576 | 8.4 | 2.4 | 28% |
+| 32 | 1152 | 16.3 | 10.2 | 63% |
+| 64 | 2304 | 30.3 | 24.3 | 80% |
+| 128 | 4608 | 36.0 | 30.0 | 83% |
+
+`frames ≤ 4` 时搬移代价落在噪声内 —— 这正是 K≈1（每连接一个在途请求）压不出问题的原因：
+服务端每次 recv 只拿到一帧，没有剩余数据可前移。只有 pipeline 模式才暴露。
+服务端单次 recv 上限是 `kReadChunkSize = 4096`，所以 body=16 时粘包深度的现实上界约 113 帧。
+
+**方案**：`read_buffer` 维护 `read_pos_` 游标，消费只做 `read_pos_ += n`（O(1)），
+惰性 compact —— 仅当 `read_pos_ >= size()/2` 时才把可读数据前移一次。
+摊还证明：compact 时搬移量 `s - r ≤ r`（因 `r ≥ s/2`），而 `r` 恰是自上次 compact
+以来的消费量，故 `Σ搬移 ≤ Σ消费`，摊还 O(1)/byte。阈值必须是 `size()/2` 而不是
+`read_pos_ > 0`，后者等于每次都搬。
+
+`RpcCodec::TryDecode` 增加一个不消费 buffer 的纯函数重载
+（`TryDecode(const char* data, size_t size, size_t* consumed, ...)`），
+旧签名保留为薄封装，4 处生产调用 + 6 处测试调用可暂不动。
+
+**不选 ring buffer**：收益同为摊还 O(1)，但 header 跨环边界要两段 memcpy、body 要拼接、
+容量语义变复杂，而这条 buffer 是单向「读-解-丢」流，换不来这些复杂度。
+
+**改漏就出 bug 的三个点**：
+
+1. 半包判断 `buffer.size() < kProtocolHeaderSize` → 必须改用 `readable()`；
+2. 帧完整性 `buffer.size() < frame_size` → 同样改用 `readable()`；
+3. 背压限流（`epoll_tcp_server_backend.cpp:490/501`、`tcp_client.cpp:154/164`）
+   → 必须改用 `readable()`，否则 `size()` 单调增长会误触发 close。
+
+**收益边界**：`frame->body.assign(...)` 的 O(body_size) 拷贝省不掉，游标只省「额外的剩余搬移」。
 
 **工作量**：中。**风险**：要同步改 `TcpClient` 侧的解码调用。
+
+**状态**：2026-10-02 讨论后决定暂缓，未实施。前置的 P9 已修复，端到端收益现在可以测量。
 
 ---
 
@@ -245,6 +300,65 @@ struct TcpServerOptions {
 
 ---
 
+## P9 — 所有 socket 都未设置 `TCP_NODELAY`
+
+**状态**：2026-10-02 已修复。
+
+**问题**：`src/` 全树没有任何 `setsockopt(..., TCP_NODELAY, ...)`。Nagle 算法会把
+「上一个小于 MSS 的段尚未被确认」期间产生的小段缓存起来，等 ACK 才发出去。
+
+**后果**：单连接只要有多个小帧在途，就会撞上对端 delayed ACK 的 40ms 超时，
+单连接 pipeline 的吞吐被钉在 ~24 QPS。
+
+**修复前**（2026-10-02，`benchmark/pipeline_bench.cpp --mode socket`，payload=16、每档 5000 请求）：
+
+| 在途请求数 K | QPS | p50 批次耗时 |
+| ---: | ---: | ---: |
+| 1 | 14005 | 70.8 us |
+| 2 | 16773 | 99.4 us |
+| 4 | 95.3 | 41683.8 us |
+| 16 | 380.1 | 41769.5 us |
+| 64 | 1500.9 | 41956.7 us |
+| 256 | 5715.7 | 43660.4 us |
+
+K≥4 后每批固定卡在 ~41.7ms，与 K 无关 —— 典型的 Nagle + delayed ACK 特征。
+K=1 时每连接只有一个在途请求，Nagle 没有段可缓存，所以完全不受影响；
+这正是该缺陷长期没被发现的原因，也说明 `rpc_bench` 的负载模型测不到它。
+
+**修复**：新增 `minirpc::SetTcpNoDelay(int fd, std::string* error)`
+（`include/minirpc/net/socket_utils.h`），三处调用：
+
+1. `TcpClient::Connect` 建连成功之后；
+2. `EpollTcpServerBackend::AcceptConnections` 中 `accept4` 之后；
+3. `CoroutineRpcServer::AcceptLoop` 中 `accept4` 之后。
+
+accepted socket **不继承**监听 socket 的选项，所以服务端必须单独设，只设监听 fd 无效。
+设置失败时客户端 `Connect` 返回错误、服务端 `close` 掉该连接（与 `epoll_ctl` 失败的处理一致）。
+
+**修复后**（同机、同参数）：
+
+| 在途请求数 K | 修复前 QPS | 修复后 QPS | 修复后 p50 批次耗时 |
+| ---: | ---: | ---: | ---: |
+| 1 | 14005 | 14702 | 66.0 us |
+| 2 | 16773 | 27242 | 72.0 us |
+| 4 | 95 | 38583 | 75.1 us |
+| 8 | 190 | 91270 | 81.6 us |
+| 16 | 380 | 133751 | 115.2 us |
+| 32 | 760 | 179348 | 170.7 us |
+| 64 | 1501 | 216520 | 285.6 us |
+| 128 | 2929 | 242821 | 509.4 us |
+| 256 | 5716 | 252430 | 1002.3 us |
+
+K=4 提升 **406×**；修复前 QPS 在 ~95 的平台持平，修复后随 K 单调上升。
+同步路径（K=1）几乎无变化，`rpc_bench` 两种服务端路径均无失败、拒绝或超时，无退化。
+
+**副作用**：小包数量上升，网络包数变多。RPC 是小包请求-响应模式，Nagle 想合并的收益
+在此为零，而延迟代价是 40ms，因此这是行业默认（gRPC / muduo / brpc / Dubbo 均默认开启）。
+
+**风险**：低（只影响发送时机，不改协议与语义）。
+
+---
+
 ## P9 — IDL 代码生成
 
 **问题**：服务/方法靠**字符串手写注册**，拼错只在运行期才发现。
@@ -258,9 +372,7 @@ struct TcpServerOptions {
 ## 建议的执行节奏
 
 ```
-本周：P0 空闲超时（P0 是全项目唯一"资源泄漏"级别的洞，最值得做）
-      + P1 配置一致性校验（小改动，顺手）
-      + P2 客户端读缓冲上限（小改动，补齐对称性）
+已完成：P0 空闲超时 + P1 配置一致性校验 + P2 客户端读缓冲上限
 
 之后：先做 P5（半天，收益明确）→ P4（需要 benchmark 证明有收益才做）
       → P6 → P8 → P3/P7（大改，需要压测数据支撑）

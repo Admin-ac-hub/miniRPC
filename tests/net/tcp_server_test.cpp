@@ -6,6 +6,7 @@
 #include <cstring>
 #include <functional>
 #include <future>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -542,6 +543,7 @@ void TestCompleteFrameBurstDoesNotTripReadBufferLimit() {
     minirpc::TcpServer server;
     minirpc::TcpServerOptions options;
     options.max_read_buffer_bytes = 1024;
+    options.max_frame_body_size = options.max_read_buffer_bytes - minirpc::kProtocolHeaderSize;
     server.SetOptions(options);
 
     std::atomic<bool> open_callback_entered{false};
@@ -574,6 +576,151 @@ void TestCompleteFrameBurstDoesNotTripReadBufferLimit() {
                      std::chrono::seconds(2)));
     ::close(fd);
     server.Stop();
+}
+
+void TestRunningOptionsChangeIsIgnored() {
+    minirpc::TcpServer server;
+    minirpc::TcpServerOptions options;
+    options.max_read_buffer_bytes = 1024;
+    options.max_frame_body_size = 1024 - minirpc::kProtocolHeaderSize;
+    server.SetOptions(options);
+    std::atomic<int> frames{0};
+    std::promise<void> changed;
+    auto changed_future = changed.get_future();
+    server.SetOnFrame([&](minirpc::ConnectionId id, uint64_t generation,
+                          minirpc::ProtocolFrame frame) {
+        if (frame.request_id == 1) {
+            // The same recv also buffers part of the next frame before this callback.
+            options.max_read_buffer_bytes = 128;
+            options.max_frame_body_size = 128 - minirpc::kProtocolHeaderSize;
+            server.SetOptions(options);
+            changed.set_value();
+        }
+        frames.fetch_add(1);
+        assert(server.SendFrame(id, generation, frame, false).ok());
+    });
+    assert(server.Start({"127.0.0.1", 19238}).ok());
+    const int fd = ConnectRaw(19238);
+    SetRecvTimeout(fd, 1000);
+    minirpc::RpcCodec codec;
+    const std::string large = codec.Encode(MakeFrame(2, 900));
+    SendAllRaw(fd, codec.Encode(MakeFrame(1, 0)) + large.substr(0, 512));
+    assert(changed_future.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    assert(ReceiveFrameRaw(fd).request_id == 1);
+    SendAllRaw(fd, large.substr(512));
+    assert(ReceiveFrameRaw(fd).body == std::string(900, 'x'));
+    ::close(fd);
+    server.Stop();
+    assert(frames.load() == 2);
+
+    server.SetOptions(options);
+    assert(server.Start({"127.0.0.1", 19238}).ok());
+    const int next_fd = ConnectRaw(19238);
+    SetRecvTimeout(next_fd, 1000);
+    SendAllRaw(next_fd, large.substr(0, minirpc::kProtocolHeaderSize));
+    AssertPeerClosed(next_fd);
+    ::close(next_fd);
+    server.Stop();
+    assert(frames.load() == 2);
+}
+
+void TestDefaultReadLimitRejectsOversizedHeader() {
+    minirpc::TcpServer server;
+    std::atomic<int> frame_count{0};
+    server.SetOnFrame([&](minirpc::ConnectionId, uint64_t, minirpc::ProtocolFrame) {
+        frame_count.fetch_add(1);
+    });
+    assert(server.Start({"127.0.0.1", 19235}).ok());
+
+    int fd = ConnectRaw(19235);
+    SetRecvTimeout(fd, 1000);
+    minirpc::RpcCodec codec;
+    std::string header = codec.Encode(MakeFrame(35, 2 * 1024 * 1024));
+    header.resize(minirpc::kProtocolHeaderSize);
+    SendAllRaw(fd, header);
+    AssertPeerClosed(fd);
+    ::close(fd);
+    server.Stop();
+    assert(frame_count.load() == 0);
+}
+
+void TestInvalidReadLimitsFailBeforeListeningAndCanRecover() {
+    minirpc::TcpServer server;
+    auto expect_invalid = [&](const minirpc::TcpServerOptions& options) {
+        server.SetOptions(options);
+        const auto status = server.Start({"127.0.0.1", 19236});
+        assert(!status.ok());
+        assert(status.code() == minirpc::StatusCode::kServerError);
+        assert(!status.message().empty());
+        assert(!server.running());
+        assert(TryConnectRaw(19236) == -1);
+    };
+
+    minirpc::TcpServerOptions options;
+    options.max_read_buffer_bytes = minirpc::kProtocolHeaderSize - 1;
+    options.max_frame_body_size = 0;
+    expect_invalid(options);
+    options.max_read_buffer_bytes = 1024;
+    options.max_frame_body_size = 1024 - minirpc::kProtocolHeaderSize + 1;
+    expect_invalid(options);
+    options.max_read_buffer_bytes = std::numeric_limits<std::size_t>::max();
+    options.max_frame_body_size = minirpc::kDefaultMaxFrameBodySize + 1;
+    expect_invalid(options);
+    options.max_frame_body_size = std::numeric_limits<std::size_t>::max();
+    expect_invalid(options);
+
+    server.SetOptions(minirpc::TcpServerOptions{});
+    assert(server.Start({"127.0.0.1", 19236}).ok());
+    server.Stop();
+}
+
+void TestConfiguredBodyLimitAndRestart() {
+    minirpc::TcpServer server;
+    std::atomic<int> frame_count{0};
+    server.SetOnFrame([&](minirpc::ConnectionId, uint64_t, minirpc::ProtocolFrame frame) {
+        assert(frame.body == std::string(frame.body.size(), 'x'));
+        frame_count.fetch_add(1);
+    });
+    minirpc::RpcCodec codec;
+    const std::size_t limits[] = {
+        0, 1024 - minirpc::kProtocolHeaderSize,
+        2 * 1024 * 1024 - minirpc::kProtocolHeaderSize, minirpc::kDefaultMaxFrameBodySize};
+    int expected_frames = 0;
+    for (const std::size_t body_limit : limits) {
+        minirpc::TcpServerOptions options;
+        options.max_frame_body_size = body_limit;
+        options.max_read_buffer_bytes = body_limit + minirpc::kProtocolHeaderSize;
+        server.SetOptions(options);
+        assert(server.Start({"127.0.0.1", 19237}).ok());
+        int fd = ConnectRaw(19237);
+        SetRecvTimeout(fd, 1000);
+        std::string data = codec.Encode(MakeFrame(37, body_limit));
+        SendAllRaw(fd, data.substr(0, minirpc::kProtocolHeaderSize - 1));
+        SendAllRaw(fd, data.substr(minirpc::kProtocolHeaderSize - 1) +
+                       codec.Encode(MakeFrame(38, 0)));
+        expected_frames += 2;
+        assert(WaitUntil([&] { return frame_count.load() == expected_frames; },
+                         std::chrono::seconds(3)));
+        data = codec.Encode(MakeFrame(39, body_limit + 1));
+        data.resize(minirpc::kProtocolHeaderSize);
+        SendAllRaw(fd, data);
+        AssertPeerClosed(fd);
+        ::close(fd);
+        server.Stop();
+        assert(frame_count.load() == expected_frames);
+    }
+
+    minirpc::TcpServerOptions options;
+    options.max_frame_body_size = 8;
+    server.SetOptions(options);
+    assert(server.Start({"127.0.0.1", 19237}).ok());
+    int fd = ConnectRaw(19237);
+    SetRecvTimeout(fd, 1000);
+    SendAllRaw(fd, codec.Encode(MakeFrame(40, 9)));
+    AssertPeerClosed(fd);
+    ::close(fd);
+    server.Stop();
+    assert(frame_count.load() == expected_frames);
 }
 
 void TestCloseAfterSendDeliversFullFrameAndClosesOnce() {
@@ -1017,6 +1164,10 @@ void TestBackpressurePausesSlowConnectionAndOtherClientsContinue() {
 }  // namespace
 
 int main() {
+    TestRunningOptionsChangeIsIgnored();
+    TestDefaultReadLimitRejectsOversizedHeader();
+    TestInvalidReadLimitsFailBeforeListeningAndCanRecover();
+    TestConfiguredBodyLimitAndRestart();
     TestStartStopIdempotency();
     TestRepeatedImmediateStartStop();
     TestConcurrentResponseWakeAndStop();

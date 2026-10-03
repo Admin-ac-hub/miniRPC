@@ -1,5 +1,6 @@
 #include "minirpc/net/tcp_server_backend.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -71,6 +72,7 @@ public:
     void SetOnFrame(OnFrameFn fn) override;
     void SetOnClose(OnCloseFn fn) override;
     void SetOnBackpressure(OnBackpressureFn fn) override;
+    void SetOnFrameRejected(TcpServer::OnFrameRejectedFn fn) override;
     void SetOptions(const TcpServerOptions& opts) override;
 
     Status Start(const Endpoint& endpoint) override;
@@ -175,6 +177,7 @@ private:
     OnFrameFn on_frame_;
     OnCloseFn on_close_;
     OnBackpressureFn on_backpressure_;
+    TcpServer::OnFrameRejectedFn on_frame_rejected_;
 
     std::thread reactor_thread_;
     int listen_fd_ = -1;
@@ -201,7 +204,17 @@ void EpollTcpServerBackend::SetOnOpen(OnOpenFn fn) { on_open_ = std::move(fn); }
 void EpollTcpServerBackend::SetOnFrame(OnFrameFn fn) { on_frame_ = std::move(fn); }
 void EpollTcpServerBackend::SetOnClose(OnCloseFn fn) { on_close_ = std::move(fn); }
 void EpollTcpServerBackend::SetOnBackpressure(OnBackpressureFn fn) { on_backpressure_ = std::move(fn); }
-void EpollTcpServerBackend::SetOptions(const TcpServerOptions& opts) { options_ = opts; }
+void EpollTcpServerBackend::SetOnFrameRejected(TcpServer::OnFrameRejectedFn fn) {
+    on_frame_rejected_ = std::move(fn);
+}
+void EpollTcpServerBackend::SetOptions(const TcpServerOptions& opts) {
+    // Stop() from a reactor callback leaves the thread alive until an external join.
+    if (running() || reactor_thread_.joinable()) {
+        Logger::Log(LogLevel::kWarn, "TcpServer::SetOptions ignored until the server is stopped");
+        return;
+    }
+    options_ = opts;
+}
 Status EpollTcpServerBackend::Start(const Endpoint& endpoint) {
     if (running_.load(std::memory_order_acquire)) {
         return Status::Ok();
@@ -213,6 +226,16 @@ Status EpollTcpServerBackend::Start(const Endpoint& endpoint) {
         reactor_thread_.join();
         CleanupAfterJoin();
     }
+    if (options_.max_frame_body_size > kDefaultMaxFrameBodySize) {
+        return Status::Error(StatusCode::kServerError,
+                             "max_frame_body_size exceeds the protocol body limit");
+    }
+    if (options_.max_read_buffer_bytes < kProtocolHeaderSize ||
+        options_.max_frame_body_size > options_.max_read_buffer_bytes - kProtocolHeaderSize) {
+        return Status::Error(StatusCode::kServerError,
+                             "max_read_buffer_bytes must fit the header and max_frame_body_size");
+    }
+    codec_ = RpcCodec(options_.max_frame_body_size);
     endpoint_ = endpoint;
 
     Status status = SetupListener();
@@ -416,6 +439,12 @@ void EpollTcpServerBackend::AcceptConnections() {
             ::close(client_fd);
             continue;
         }
+        // accepted socket 不继承监听 socket 的选项，必须单独设。
+        std::string nodelay_error;
+        if (!SetTcpNoDelay(client_fd, &nodelay_error)) {
+            ::close(client_fd);
+            continue;
+        }
 
         epoll_event event{};
         event.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
@@ -463,7 +492,9 @@ void EpollTcpServerBackend::HandleClientRead(int client_fd) {
 
     char temp[kReadChunkSize];
     while (true) {
-        const ssize_t n = ::recv(client_fd, temp, sizeof(temp), 0);
+        const std::size_t read_size =
+            std::min(sizeof(temp), options_.max_read_buffer_bytes - conn->read_buffer.size());
+        const ssize_t n = ::recv(client_fd, temp, read_size, 0);
         if (n > 0) {
             conn->read_buffer.append(temp, static_cast<std::size_t>(n));
             TouchConnection(*conn);
@@ -473,14 +504,43 @@ void EpollTcpServerBackend::HandleClientRead(int client_fd) {
                 std::string error;
                 const DecodeResult result = codec_.TryDecode(conn->read_buffer, &frame, &error);
                 if (result == DecodeResult::kNeedMoreData) {
-                    if (conn->read_buffer.size() > options_.max_read_buffer_bytes) {
-                        CloseByFd(client_fd);
+                    if (conn->read_buffer.size() >= options_.max_read_buffer_bytes) {
+                        // 当前配置校验（max_frame_body_size <= max_read_buffer_bytes - 20）
+                        // 保证任何合法帧都能在预算内收全，所以这条分支不可达。
+                        // 保留它是为了防御校验被放松；一旦可达，处置与协议错误一致。
+                        bool handled = false;
+                        if (on_frame_rejected_) {
+                            try {
+                                handled = on_frame_rejected_(
+                                    conn->id, conn->generation, frame.request_id,
+                                    "read buffer overflow before a complete frame arrived");
+                            } catch (...) {
+                                Logger::Log(LogLevel::kError, "frame rejected callback threw");
+                            }
+                        }
+                        if (!handled) {
+                            CloseByFd(client_fd);
+                        }
                         return;
                     }
                     break;
                 }
                 if (result == DecodeResult::kProtocolError) {
-                    CloseByFd(client_fd);
+                    // magic/version 不符时 frame.request_id 为 0；其余协议错误（msg_type /
+                    // codec / body_size 超限）头已解析完整，request_id 可信。
+                    // 上层若接管关闭（回错误响应并设 close_after_send），backend 就不再直接关。
+                    bool handled = false;
+                    if (on_frame_rejected_) {
+                        try {
+                            handled = on_frame_rejected_(conn->id, conn->generation,
+                                                         frame.request_id, error);
+                        } catch (...) {
+                            Logger::Log(LogLevel::kError, "frame rejected callback threw");
+                        }
+                    }
+                    if (!handled) {
+                        CloseByFd(client_fd);
+                    }
                     return;
                 }
 

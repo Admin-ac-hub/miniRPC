@@ -15,6 +15,7 @@ public:
     virtual void SetOnFrame(TcpServer::OnFrameFn fn) = 0;
     virtual void SetOnClose(TcpServer::OnCloseFn fn) = 0;
     virtual void SetOnBackpressure(TcpServer::OnBackpressureFn fn) = 0;
+    virtual void SetOnFrameRejected(TcpServer::OnFrameRejectedFn fn) = 0;
     virtual void SetOptions(const TcpServerOptions& opts) = 0;
 
     virtual Status Start(const Endpoint& endpoint) = 0;
@@ -32,6 +33,7 @@ public:
 
 class TcpServerInternalAccess {
 public:
+    static void SetOnFrameRejected(TcpServer& server, TcpServer::OnFrameRejectedFn fn);
     static Status SendFrame(TcpServer& server,
                             ConnectionId conn_id,
                             uint64_t generation,

@@ -13,5 +13,6 @@ cmake-build-*/
 .claude/
 AGENTS.md
 CLAUDE.md
+.workbuddy-ai/
 docs/superpowers/
 compile_commands.json

@@ -56,6 +56,12 @@ private:
                               const Status& send_status,
                               std::chrono::steady_clock::time_point start_time);
     void CompletePendingRequest();
+    // 帧在进入 RPC 处理前被拒（协议错误 / 读缓冲溢出）时，回一个带 request_id 的错误响应再关连接。
+    // 返回 false 表示没能排入响应，由 backend 直接关闭连接。
+    bool SendRejectionResponse(ConnectionId conn_id,
+                               uint64_t generation,
+                               uint64_t request_id,
+                               const std::string& reason);
     bool WaitForPendingRequests(std::chrono::milliseconds grace_period);
 
     std::atomic<bool> running_;

@@ -50,7 +50,8 @@ Status EncodeResponseFrame(uint64_t request_id,
                            ProtocolFrame* frame) {
     try {
         ProtocolFrame encoded = MakeResponseFrame(request_id, response);
-        if (encoded.body.size() > kDefaultMaxFrameBodySize) {
+        // Match the default RPC receive budget, including serialization overhead.
+        if (encoded.body.size() > TcpServerOptions{}.max_frame_body_size) {
             return Status::Error(StatusCode::kSerializeError, "response body too large");
         }
         *frame = std::move(encoded);
@@ -82,6 +83,18 @@ RpcServer::RpcServer()
       shutdown_state_(ShutdownState::kStopped),
       thread_pool_(4, 10000) {
     metrics_.SetServerState(static_cast<uint64_t>(ShutdownState::kStopped));
+    TcpServerInternalAccess::SetOnFrameRejected(
+        tcp_server_,
+        [this](ConnectionId conn_id, uint64_t generation, uint64_t request_id,
+               const std::string& reason) {
+            metrics_.RecordProtocolError();
+            // request_id 为 0 表示头没解析到该字段（magic/version 不符，或头都不完整），
+            // 构造不出能匹配的响应，交回 backend 直接关闭。
+            if (request_id == 0) {
+                return false;
+            }
+            return SendRejectionResponse(conn_id, generation, request_id, reason);
+        });
     tcp_server_.SetOnOpen([this](ConnectionId, uint64_t) {
         metrics_.IncrementActiveConnections();
     });
@@ -373,6 +386,27 @@ void RpcServer::CompletePendingRequest() {
         metrics_.DecrementPendingRequests();
     }
     drain_cv_.notify_all();
+}
+
+bool RpcServer::SendRejectionResponse(ConnectionId conn_id,
+                                      uint64_t generation,
+                                      uint64_t request_id,
+                                      const std::string& reason) {
+    // 这条请求从未被准入，不涉及 pending 计数，所以 completion 传空。
+    RpcResponse response = MakeErrorResponse(request_id, StatusCode::kProtocolError, reason);
+    ProtocolFrame response_frame;
+    if (!PrepareResponseFrame(request_id, &response, &response_frame).ok()) {
+        return false;
+    }
+    const Status send_status = TcpServerInternalAccess::SendFrame(
+        tcp_server_,
+        conn_id,
+        generation,
+        response_frame,
+        /*close_after_send=*/true,
+        [](Status) {});
+    // 入队成功即交给 close_after_send 关闭；入队失败则交回 backend 直接关。
+    return send_status.ok();
 }
 
 bool RpcServer::WaitForPendingRequests(std::chrono::milliseconds grace_period) {

@@ -18,6 +18,7 @@ struct SendResult {
 };
 
 bool SetNonBlocking(int fd, std::string* error);
+bool SetTcpNoDelay(int fd, std::string* error);
 SendResult SendAll(int fd, const char* data, std::size_t size);
 std::string LastSocketError(const std::string& action, int error_code);
 

@@ -48,6 +48,11 @@ void TcpServer::CloseConnection(ConnectionId conn_id, uint64_t generation) {
     impl_->backend->CloseConnection(conn_id, generation);
 }
 
+void TcpServerInternalAccess::SetOnFrameRejected(TcpServer& server,
+                                                 TcpServer::OnFrameRejectedFn fn) {
+    server.impl_->backend->SetOnFrameRejected(std::move(fn));
+}
+
 Status TcpServerInternalAccess::SendFrame(TcpServer& server,
                                           ConnectionId conn_id,
                                           uint64_t generation,

@@ -20,6 +20,7 @@ public:
     ThreadPool& operator=(const ThreadPool&) = delete;
 
     void Start();
+    // Reject new posts, drain accepted tasks, then join. Call outside worker threads.
     void Stop();
     bool Post(std::function<void()> task);
     std::size_t queued_tasks() const;

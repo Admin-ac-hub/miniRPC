@@ -61,7 +61,7 @@ RpcClient
 
 - 请求、响应、成功、失败、超时、拒绝和 pending 指标。
 - active connection、背压连接、最大写缓冲和线程池队列指标。
-- 平均延迟及最近 10000 个样本的 P50/P95/P99。
+- 累计平均延迟及最多 10000 个原子槽保留的近期样本 P50/P95/P99（并发时为近似窗口）。
 - 服务状态、停机开始时间和 grace period 超时指标。
 - Linux Debug/Release 测试、benchmark，以及独立 sanitizer 验证流程。
 

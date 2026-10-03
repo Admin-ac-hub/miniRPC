@@ -1,5 +1,6 @@
 #include "minirpc/net/tcp_client.h"
 
+#include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
@@ -23,8 +24,15 @@ void CloseFd(int* fd) {
 
 }  // namespace
 
-TcpClient::TcpClient()
-    : closing_(false),
+TcpClient::TcpClient() : TcpClient(TcpClientOptions{}) {}
+
+TcpClient::TcpClient(const TcpClientOptions& options)
+    : options_(options),
+      codec_(options.max_read_buffer_bytes >= kProtocolHeaderSize
+                 ? std::min(kDefaultMaxFrameBodySize,
+                            options.max_read_buffer_bytes - kProtocolHeaderSize)
+                 : 0),
+      closing_(false),
       close_fired_(false),
       fd_(-1),
       state_(ConnectionState::kDisconnected) {}
@@ -36,6 +44,10 @@ void TcpClient::SetOnClose(OnCloseFn fn) { on_close_ = std::move(fn); }
 
 Status TcpClient::Connect(const Endpoint& endpoint) {
     std::lock_guard<std::mutex> connect_lock(connect_mutex_);
+    if (options_.max_read_buffer_bytes < kProtocolHeaderSize) {
+        return Status::Error(StatusCode::kNetworkError,
+                             "max_read_buffer_bytes must fit the protocol header");
+    }
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         if (fd_ != -1) return Status::Ok();
@@ -63,6 +75,12 @@ Status TcpClient::Connect(const Endpoint& endpoint) {
         ::close(fd);
         state_.store(ConnectionState::kDisconnected, std::memory_order_release);
         return Status::Error(StatusCode::kNetworkError, LastSocketError("connect failed", err));
+    }
+    std::string nodelay_error;
+    if (!SetTcpNoDelay(fd, &nodelay_error)) {
+        ::close(fd);
+        state_.store(ConnectionState::kDisconnected, std::memory_order_release);
+        return Status::Error(StatusCode::kNetworkError, nodelay_error);
     }
     closing_.store(false, std::memory_order_release);
     close_fired_.store(false, std::memory_order_release);
@@ -138,7 +156,9 @@ void TcpClient::ReaderLoop() {
         }
         if (fd == -1) break;
 
-        const ssize_t n = ::recv(fd, temp, sizeof(temp), 0);
+        const std::size_t read_size =
+            std::min(sizeof(temp), options_.max_read_buffer_bytes - buffer.size());
+        const ssize_t n = ::recv(fd, temp, read_size, 0);
         if (n > 0) {
             buffer.append(temp, static_cast<std::size_t>(n));
             bool decode_error = false;
@@ -146,7 +166,14 @@ void TcpClient::ReaderLoop() {
                 ProtocolFrame frame;
                 std::string error;
                 const DecodeResult result = codec_.TryDecode(buffer, &frame, &error);
-                if (result == DecodeResult::kNeedMoreData) break;
+                if (result == DecodeResult::kNeedMoreData) {
+                    if (buffer.size() >= options_.max_read_buffer_bytes) {
+                        reason = CloseReason::kProtocolError;
+                        message = "read buffer limit exceeded";
+                        decode_error = true;
+                    }
+                    break;
+                }
                 if (result == DecodeResult::kProtocolError) {
                     reason = CloseReason::kProtocolError;
                     message = error;

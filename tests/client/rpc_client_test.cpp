@@ -19,6 +19,7 @@
 #include "minirpc/client/rpc_client.h"
 #include "minirpc/core/status.h"
 #include "minirpc/net/tcp_client.h"
+#include "minirpc/net/tcp_server.h"
 #include "minirpc/protocol/body_codec.h"
 #include "minirpc/protocol/codec.h"
 #include "minirpc/protocol/frame.h"
@@ -82,22 +83,13 @@ void SendAllRaw(int fd, const std::string& data) {
     }
 }
 
-minirpc::ProtocolFrame ReceiveFrameRaw(int fd) {
+minirpc::ProtocolFrame ReceiveFrameRaw(int fd, std::string& buffer) {
     timeval timeout{};
     timeout.tv_sec = 10;
     assert(::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
 
     minirpc::RpcCodec codec;
-    std::string buffer;
     while (true) {
-        char chunk[64 * 1024];
-        ssize_t n = 0;
-        do {
-            n = ::recv(fd, chunk, sizeof(chunk), 0);
-        } while (n == -1 && errno == EINTR);
-        assert(n > 0);
-        buffer.append(chunk, static_cast<std::size_t>(n));
-
         minirpc::ProtocolFrame frame;
         std::string error;
         const minirpc::DecodeResult result = codec.TryDecode(buffer, &frame, &error);
@@ -105,6 +97,13 @@ minirpc::ProtocolFrame ReceiveFrameRaw(int fd) {
         if (result == minirpc::DecodeResult::kSuccess) {
             return frame;
         }
+        char chunk[64 * 1024];
+        ssize_t n = 0;
+        do {
+            n = ::recv(fd, chunk, sizeof(chunk), 0);
+        } while (n == -1 && errno == EINTR);
+        assert(n > 0);
+        buffer.append(chunk, static_cast<std::size_t>(n));
     }
 }
 
@@ -189,6 +188,34 @@ void TestBasicEcho() {
     client.Close();
     server.Stop();
     assert(server.metrics().active_connections() == 0);
+}
+
+void TestOversizedResponseFailsAllPendingCallsPromptly() {
+    minirpc::TcpServer server;
+    int request_count = 0;
+    server.SetOnFrame([&](minirpc::ConnectionId id, uint64_t generation,
+                          minirpc::ProtocolFrame frame) {
+        if (++request_count != 2) return;
+        frame.message_type = minirpc::MessageType::kResponse;
+        frame.body.assign(2 * 1024 * 1024, 'x');
+        assert(server.SendFrame(id, generation, frame, false).ok());
+    });
+    assert(server.Start({"127.0.0.1", 19535}).ok());
+    minirpc::RpcClient client({"127.0.0.1", 19535});
+    auto first = client.CallAsync("EchoService", "Echo", "first", std::chrono::seconds(5));
+    auto second = client.CallAsync("EchoService", "Echo", "second", std::chrono::seconds(5));
+    assert(first.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    assert(second.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    const auto first_response = first.get();
+    const auto second_response = second.get();
+    assert(first_response.status_code == kNetworkError);
+    assert(second_response.status_code == kNetworkError);
+    assert(!first_response.error_message.empty());
+    assert(!second_response.error_message.empty());
+    assert(first_response.request_id != second_response.request_id);
+    client.Close();
+    server.Stop();
+    assert(request_count == 2);
 }
 
 void TestTimeoutCleanup() {
@@ -581,9 +608,68 @@ void TestDrainingRejectsNewRequestsOnExistingConnection() {
     assert(server.metrics().success_requests() == 1);
 }
 
+void TestHardStopDrainsQueuedHandlersAndRestartIsClean() {
+    constexpr uint16_t kPort = 19537;
+    constexpr int kRequests = 12;
+    minirpc::RpcServer server;
+    std::promise<void> release;
+    auto gate = release.get_future().share();
+    std::atomic<int> executed{0};
+    server.RegisterService("EchoService", "Echo", [&](const minirpc::RpcRequest& request) {
+        gate.wait();
+        executed.fetch_add(1);
+        return EchoHandler(request);
+    });
+    assert(server.Start({"127.0.0.1", kPort}).ok());
+    minirpc::RpcClient client({"127.0.0.1", kPort});
+    std::vector<std::future<minirpc::RpcResponse>> calls;
+    for (int i = 0; i < kRequests; ++i) {
+        calls.push_back(client.CallAsync("EchoService", "Echo", "queued", std::chrono::seconds(5)));
+    }
+    assert(WaitUntil([&] {
+        return server.metrics().pending_requests() == kRequests &&
+               server.threadpool_queue_size() == kRequests - 4;
+    }, std::chrono::seconds(1)));
+    auto stopped = std::async(std::launch::async, [&] {
+        server.Stop(std::chrono::milliseconds::zero());
+    });
+    for (auto& call : calls) {
+        assert(call.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+        assert(call.get().status_code == kNetworkError);
+    }
+    assert(stopped.wait_for(std::chrono::milliseconds::zero()) == std::future_status::timeout);
+    release.set_value();
+    assert(stopped.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    stopped.get();
+    assert(executed.load() == kRequests);
+    assert(server.threadpool_queue_size() == 0);
+    assert(server.metrics().pending_requests() == 0);
+    assert(server.metrics().failed_requests() == kRequests);
+    assert(server.metrics().latency_samples() == kRequests);
+    assert(server.metrics().graceful_shutdown_timeout_count() == 1);
+    client.Close();
+
+    minirpc::RpcServer occupied;
+    assert(occupied.Start({"127.0.0.1", kPort}).ok());
+    assert(!server.Start({"127.0.0.1", kPort}).ok());
+    assert(!server.running());
+    assert(server.threadpool_queue_size() == 0);
+    occupied.Stop();
+    assert(server.Start({"127.0.0.1", kPort}).ok());
+    const auto response = client.Call("EchoService", "Echo", "restarted", std::chrono::seconds(2));
+    assert(response.status_code == kOk);
+    assert(response.payload == "restarted");
+    client.Close();
+    server.Stop();
+    assert(executed.load() == kRequests + 1);
+    assert(server.threadpool_queue_size() == 0);
+    assert(server.metrics().pending_requests() == 0);
+}
+
 void TestGracefulStopWaitsForResponseWriteCompletion() {
     constexpr uint16_t kPort = 19512;
-    constexpr std::size_t kResponseBytes = 8 * 1024 * 1024;
+    constexpr std::size_t kResponseBytes = 1024 * 1024;
+    constexpr uint64_t kRequestCount = 8;
 
     minirpc::RpcServer server;
     std::mutex gate_mutex;
@@ -620,9 +706,16 @@ void TestGracefulStopWaitsForResponseWriteCompletion() {
     request_frame.codec_type = minirpc::CodecType::kProtobuf;
     request_frame.body = minirpc::EncodeRequestBody(request);
     minirpc::RpcCodec codec;
-    SendAllRaw(fd, codec.Encode(request_frame));
-    assert(WaitUntil([&] { return handler_entered.load(std::memory_order_acquire); },
-                     std::chrono::seconds(1)));
+    std::string requests;
+    for (uint64_t id = 1; id <= kRequestCount; ++id) {
+        request_frame.request_id = id;
+        requests += codec.Encode(request_frame);
+    }
+    SendAllRaw(fd, requests);
+    assert(WaitUntil([&] {
+        return handler_entered.load(std::memory_order_acquire) &&
+               server.metrics().pending_requests() == kRequestCount;
+    }, std::chrono::seconds(1)));
 
     {
         std::lock_guard<std::mutex> lock(gate_mutex);
@@ -633,7 +726,7 @@ void TestGracefulStopWaitsForResponseWriteCompletion() {
                      std::chrono::seconds(1)));
     assert(WaitUntil([&] { return server.metrics().max_write_buffer_size() >= 1024 * 1024; },
                      std::chrono::seconds(2)));
-    assert(server.metrics().pending_requests() == 1);
+    assert(server.metrics().pending_requests() > 0);
 
     std::atomic<bool> stop_finished{false};
     std::thread stopper([&] {
@@ -645,32 +738,44 @@ void TestGracefulStopWaitsForResponseWriteCompletion() {
     }, std::chrono::seconds(1)));
     assert(!stop_finished.load(std::memory_order_acquire));
 
-    const minirpc::ProtocolFrame response_frame = ReceiveFrameRaw(fd);
-    assert(response_frame.request_id == request.request_id);
-    assert(response_frame.message_type == minirpc::MessageType::kResponse);
-    const minirpc::RpcResponse response =
-        minirpc::DecodeResponseBody(response_frame.request_id, response_frame.body);
-    assert(response.status_code == kOk);
-    assert(response.payload.size() == kResponseBytes);
-    assert(response.payload.front() == 'r');
-    assert(response.payload.back() == 'r');
+    std::string buffered;
+    std::vector<bool> received(kRequestCount, false);
+    for (uint64_t i = 0; i < kRequestCount; ++i) {
+        const minirpc::ProtocolFrame response_frame = ReceiveFrameRaw(fd, buffered);
+        assert(response_frame.request_id >= 1 && response_frame.request_id <= kRequestCount);
+        assert(!received[response_frame.request_id - 1]);
+        received[response_frame.request_id - 1] = true;
+        assert(response_frame.message_type == minirpc::MessageType::kResponse);
+        const auto response =
+            minirpc::DecodeResponseBody(response_frame.request_id, response_frame.body);
+        assert(response.status_code == kOk);
+        assert(response.payload == std::string(kResponseBytes, 'r'));
+    }
 
     stopper.join();
     ::close(fd);
     assert(stop_finished.load(std::memory_order_acquire));
     assert(server.metrics().pending_requests() == 0);
     assert(server.metrics().graceful_shutdown_timeout_count() == 0);
+    assert(server.metrics().total_responses() == kRequestCount);
+    assert(server.metrics().success_requests() == kRequestCount);
 }
 
-void TestOversizedHandlerResponseReturnsSerializeError() {
+void TestOversizedHandlerResponseReturnsSerializeError(std::size_t bytes,
+                                                        bool oversized_error = false) {
     constexpr uint16_t kPort = 19513;
 
     minirpc::RpcServer server;
-    server.RegisterService("EchoService", "Oversized", [](const minirpc::RpcRequest& request) {
+    server.RegisterService("EchoService", "Oversized", [=](const minirpc::RpcRequest& request) {
         minirpc::RpcResponse response;
         response.request_id = request.request_id;
         response.status_code = kOk;
-        response.payload.assign(minirpc::kDefaultMaxFrameBodySize, 'x');
+        if (oversized_error) {
+            response.status_code = static_cast<int32_t>(minirpc::StatusCode::kServerError);
+            response.error_message.assign(bytes, 'x');
+        } else {
+            response.payload.assign(bytes, 'x');
+        }
         return response;
     });
     server.RegisterService("EchoService", "Echo", EchoHandler);
@@ -681,6 +786,8 @@ void TestOversizedHandlerResponseReturnsSerializeError() {
         client.Call("EchoService", "Oversized", "", std::chrono::seconds(5));
     assert(oversized.status_code == kSerializeError);
     assert(oversized.error_message == "response body too large");
+    assert(oversized.payload.empty());
+    assert(oversized.request_id == 1);
 
     const minirpc::RpcResponse echo =
         client.Call("EchoService", "Echo", "still-alive", std::chrono::seconds(2));
@@ -688,17 +795,62 @@ void TestOversizedHandlerResponseReturnsSerializeError() {
     assert(echo.payload == "still-alive");
     assert(WaitUntil([&] { return server.metrics().pending_requests() == 0; },
                      std::chrono::seconds(1)));
+    assert(server.metrics().total_responses() == 2);
+    assert(server.metrics().failed_requests() == 1);
+    assert(server.metrics().success_requests() == 1);
+    assert(server.metrics().protocol_error_total() == 0);
 
     client.Close();
     server.Stop();
 }
 
-void TestGracefulTimeoutCancelsAcceptedResponseWrite() {
-    constexpr uint16_t kPort = 19514;
-    constexpr std::size_t kResponseBytes = 8 * 1024 * 1024;
+void TestResponseBodyLimitIncludesSerializationOverhead() {
+    constexpr std::size_t kBodyLimit = 2 * 1024 * 1024 - minirpc::kProtocolHeaderSize;
+    minirpc::RpcResponse boundary;
+    boundary.payload.assign(kBodyLimit, 'b');
+    const std::size_t overhead = minirpc::EncodeResponseBody(boundary).size() - kBodyLimit;
+    assert(overhead > 0);
+    boundary.payload.resize(kBodyLimit - overhead);
+    assert(minirpc::EncodeResponseBody(boundary).size() == kBodyLimit);
 
     minirpc::RpcServer server;
-    server.RegisterService("EchoService", "Large", [](const minirpc::RpcRequest& request) {
+    server.RegisterService("EchoService", "Boundary", [=](const minirpc::RpcRequest& request) {
+        minirpc::RpcResponse response = boundary;
+        if (request.payload == "over") response.payload.push_back('b');
+        return response;
+    });
+    assert(server.Start({"127.0.0.1", 19536}).ok());
+    minirpc::RpcClient client({"127.0.0.1", 19536});
+    for (const std::string input : {"exact", "over", "exact"}) {
+        const auto response = client.Call("EchoService", "Boundary", input,
+                                          std::chrono::seconds(5));
+        if (input == "over") {
+            assert(response.status_code == kSerializeError);
+            assert(response.error_message == "response body too large");
+            assert(response.payload.empty());
+        } else {
+            assert(response.status_code == kOk);
+            assert(response.payload == boundary.payload);
+            assert(minirpc::EncodeResponseBody(response).size() == kBodyLimit);
+        }
+    }
+    client.Close();
+    server.Stop();
+    assert(server.metrics().total_responses() == 3);
+    assert(server.metrics().success_requests() == 2);
+    assert(server.metrics().failed_requests() == 1);
+}
+
+void TestGracefulTimeoutCancelsAcceptedResponseWrite() {
+    constexpr uint16_t kPort = 19514;
+    constexpr std::size_t kResponseBytes = 1024 * 1024;
+    constexpr uint64_t kRequestCount = 8;
+
+    minirpc::RpcServer server;
+    std::promise<void> release_handlers;
+    auto gate = release_handlers.get_future().share();
+    server.RegisterService("EchoService", "Large", [gate](const minirpc::RpcRequest& request) {
+        gate.wait();
         minirpc::RpcResponse response;
         response.request_id = request.request_id;
         response.status_code = kOk;
@@ -719,11 +871,19 @@ void TestGracefulTimeoutCancelsAcceptedResponseWrite() {
     request_frame.codec_type = minirpc::CodecType::kProtobuf;
     request_frame.body = minirpc::EncodeRequestBody(request);
     minirpc::RpcCodec codec;
-    SendAllRaw(fd, codec.Encode(request_frame));
+    std::string requests;
+    for (uint64_t id = 1; id <= kRequestCount; ++id) {
+        request_frame.request_id = id;
+        requests += codec.Encode(request_frame);
+    }
+    SendAllRaw(fd, requests);
+    assert(WaitUntil([&] { return server.metrics().pending_requests() == kRequestCount; },
+                     std::chrono::seconds(1)));
+    release_handlers.set_value();
 
     assert(WaitUntil([&] { return server.metrics().max_write_buffer_size() >= 1024 * 1024; },
                      std::chrono::seconds(2)));
-    assert(server.metrics().pending_requests() == 1);
+    assert(server.metrics().pending_requests() > 0);
 
     const auto stop_start = std::chrono::steady_clock::now();
     server.Stop(std::chrono::milliseconds::zero());
@@ -733,15 +893,21 @@ void TestGracefulTimeoutCancelsAcceptedResponseWrite() {
     assert(stop_elapsed < std::chrono::seconds(5));
     assert(server.metrics().pending_requests() == 0);
     assert(server.metrics().graceful_shutdown_timeout_count() == 1);
-    assert(server.metrics().total_responses() == 0);
-    assert(server.metrics().success_requests() == 0);
-    assert(server.metrics().failed_requests() == 1);
-    assert(server.metrics().latency_samples() == 1);
+    assert(server.metrics().failed_requests() > 0);
+    assert(server.metrics().success_requests() == server.metrics().total_responses());
+    assert(server.metrics().failed_requests() + server.metrics().total_responses() == kRequestCount);
+    assert(server.metrics().latency_samples() == kRequestCount);
 }
 
 }  // namespace
 
 int main() {
+    TestHardStopDrainsQueuedHandlersAndRestartIsClean();
+    TestOversizedHandlerResponseReturnsSerializeError(3 * 1024 * 1024);
+    TestOversizedHandlerResponseReturnsSerializeError(minirpc::kDefaultMaxFrameBodySize);
+    TestOversizedHandlerResponseReturnsSerializeError(3 * 1024 * 1024, true);
+    TestResponseBodyLimitIncludesSerializationOverhead();
+    TestOversizedResponseFailsAllPendingCallsPromptly();
     TestImmediateDestructionStopsTimeoutCleaner();
     TestBasicEcho();
     TestTimeoutCleanup();
@@ -758,7 +924,6 @@ int main() {
     TestGracePeriodTimeoutIsRecorded();
     TestDrainingRejectsNewRequestsOnExistingConnection();
     TestGracefulStopWaitsForResponseWriteCompletion();
-    TestOversizedHandlerResponseReturnsSerializeError();
     TestGracefulTimeoutCancelsAcceptedResponseWrite();
     return 0;
 }

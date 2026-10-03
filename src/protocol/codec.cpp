@@ -52,6 +52,22 @@ bool IsKnownCodecType(uint8_t value) {
     return value <= static_cast<uint8_t>(CodecType::kProtobuf);
 }
 
+// 头解析到 request_id 之后的所有出口都调用它，让调用方拿到连接身份。
+// body 不在此填充：kNeedMoreData / kProtocolError 时它并不完整。
+void FillFrameHeader(ProtocolFrame* frame,
+                     uint16_t version,
+                     uint8_t message_type,
+                     uint8_t codec_type,
+                     uint64_t request_id) {
+    if (frame == nullptr) {
+        return;
+    }
+    frame->version = version;
+    frame->message_type = static_cast<MessageType>(message_type);
+    frame->codec_type = static_cast<CodecType>(codec_type);
+    frame->request_id = request_id;
+}
+
 }  // namespace
 
 RpcCodec::RpcCodec(std::size_t max_body_size) : max_body_size_(max_body_size) {}
@@ -95,41 +111,46 @@ DecodeResult RpcCodec::TryDecode(std::string& buffer,
         return DecodeResult::kProtocolError;
     }
 
+    // magic/version 已确认可信，先把头字段全读出来。
+    // 此后每个出口都会填充 frame 的头字段，让调用方能拿到 request_id，
+    // 从而在关闭连接前回一个带正确 request_id 的错误响应。
+    const uint64_t request_id = ReadUint64(data + 8);
+    const uint32_t body_size = ReadUint32(data + 16);
     const uint8_t message_type = static_cast<unsigned char>(data[6]);
+    const uint8_t codec_type = static_cast<unsigned char>(data[7]);
+
     if (!IsKnownMessageType(message_type)) {
         if (error != nullptr) {
             *error = "unsupported message type";
         }
+        FillFrameHeader(frame, version, message_type, codec_type, request_id);
         return DecodeResult::kProtocolError;
     }
 
-    const uint8_t codec_type = static_cast<unsigned char>(data[7]);
     if (!IsKnownCodecType(codec_type)) {
         if (error != nullptr) {
             *error = "unsupported codec type";
         }
+        FillFrameHeader(frame, version, message_type, codec_type, request_id);
         return DecodeResult::kProtocolError;
     }
 
-    const uint64_t request_id = ReadUint64(data + 8);
-    const uint32_t body_size = ReadUint32(data + 16);
     if (body_size > max_body_size_) {
         if (error != nullptr) {
             *error = "frame body too large";
         }
+        FillFrameHeader(frame, version, message_type, codec_type, request_id);
         return DecodeResult::kProtocolError;
     }
 
     const std::size_t frame_size = kProtocolHeaderSize + static_cast<std::size_t>(body_size);
     if (buffer.size() < frame_size) {
+        FillFrameHeader(frame, version, message_type, codec_type, request_id);
         return DecodeResult::kNeedMoreData;
     }
 
+    FillFrameHeader(frame, version, message_type, codec_type, request_id);
     if (frame != nullptr) {
-        frame->version = version;
-        frame->message_type = static_cast<MessageType>(message_type);
-        frame->codec_type = static_cast<CodecType>(codec_type);
-        frame->request_id = request_id;
         frame->body.assign(buffer.data() + kProtocolHeaderSize, body_size);
     }
 

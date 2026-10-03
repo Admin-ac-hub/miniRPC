@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -13,6 +14,10 @@
 #include "minirpc/protocol/frame.h"
 
 namespace minirpc {
+
+struct TcpClientOptions {
+    std::size_t max_read_buffer_bytes = 2 * 1024 * 1024;
+};
 
 class TcpClient {
 public:
@@ -27,6 +32,7 @@ public:
     using OnCloseFn = std::function<void(CloseReason, const std::string& message)>;
 
     TcpClient();
+    explicit TcpClient(const TcpClientOptions& options);
     ~TcpClient();
 
     TcpClient(const TcpClient&)            = delete;
@@ -46,6 +52,7 @@ private:
     void ReaderLoop();
     void FireClose(CloseReason reason, const std::string& message);
 
+    const TcpClientOptions options_;
     RpcCodec codec_;
     OnFrameFn on_frame_;
     OnCloseFn on_close_;

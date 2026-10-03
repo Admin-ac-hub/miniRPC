@@ -108,6 +108,23 @@ auto future = client.CallAsync(
 auto response = future.get();
 ```
 
+## 作为库集成
+
+miniRPC 提供 CMake 安装与导出规则，外部项目可以 `find_package` 后直接链接：
+
+```sh
+cmake -S . -B build
+cmake --build build -j
+cmake --install build --prefix /your/prefix
+```
+
+```cmake
+find_package(miniRPC REQUIRED)
+target_link_libraries(my_server PRIVATE minirpc::minirpc)
+```
+
+`miniRPCConfig.cmake` 会解析 `Threads` 与 `Protobuf` 依赖；服务端基于 Linux `epoll`，仅可在 Linux 上构建。
+
 ## 协议与可靠性
 
 外层协议头固定为 20 字节，所有整数使用大端序：
@@ -120,6 +137,8 @@ auto response = future.get();
 - 客户端 pending 请求会被响应、超时或连接关闭主动完成，不会无限等待。
 - `ThreadPool::Post()` 队列满时服务端返回明确错误，避免任务无限堆积。
 - `TcpServerOptions::max_connections` 限制同时接入的连接数，`0` 表示不限制。
+- TCP 两端默认接收整帧上限为 2 MiB（含 20 字节头）；超限声明在帧头解码时拒绝。服务端在 `Start()` 校验 body 上限与读缓冲配置一致，低层 TCP 配置方法见协议文档。
+- `RpcServer` 的序列化响应 body 上限为 2 MiB − 20 字节；超限改回 `kSerializeError` 应用级错误，连接仍可继续使用。
 - 每个慢连接单独触发背压，不暂停 accept，也不阻塞其他连接。
 - `Stop(grace_period)` 等待 handler 完成及响应整帧被发送接口接受；超时后执行硬停机。
 
@@ -127,13 +146,14 @@ auto response = future.get();
 
 ## 性能结果
 
-当前压测以 Reactor 主路径为基线，并附带 Coroutine 实验路径的控制流对比。在固定 32 连接、每轮 100000 请求的 5 轮测试中，Reactor 中位 QPS 为 83887、P99 为 720us，两条路径合计 100 万请求全部成功。结果来自客户端与服务端同进程的闭环测试，不代表跨机器容量上限。完整环境、命令和分析见 [docs/benchmark_report.md](docs/benchmark_report.md)，复现方法见 [docs/performance.md](docs/performance.md)。
+当前压测以 Reactor 主路径为基线，并附带 Coroutine 实验路径的控制流对比。在固定 32 连接、每轮 100000 请求的 5 轮测试中，Reactor 中位 QPS 为 83887、P99 为 720us，两条路径合计 100 万请求全部成功。结果来自客户端与服务端同进程的闭环测试，不代表跨机器容量上限；同一配置重复测量存在明显轮间波动，单次中位数不应解释为稳定容量，专项重复测量见 [docs/metrics_benchmark.md](docs/metrics_benchmark.md)。完整环境、命令和分析见 [docs/benchmark_report.md](docs/benchmark_report.md)，复现方法见 [docs/performance.md](docs/performance.md)。
 
 ## 测试
 
 GitHub Actions 在 Linux 上执行 Debug/Release 构建和完整 `ctest`。测试覆盖：
 
 - 协议编解码、半包和粘包
+- 接收大小边界、非法配置、超限响应主动失败与重连
 - TCP server/client 与 RPC 集成
 - 多连接收发、连接 churn 和 fd 复用
 - 最大连接数拒绝与容量释放
@@ -150,7 +170,7 @@ src/               框架实现
 proto/             Protobuf body 定义
 examples/          echo server/client
 tests/             单元与集成测试
-benchmark/         rpc_bench 压测程序
+benchmark/         rpc_bench / metrics_bench / pipeline_bench 压测程序
 docs/              架构、协议与性能文档
 ```
 
@@ -161,6 +181,7 @@ docs/              架构、协议与性能文档
 - [协程路径](docs/coroutine.md)
 - [压测方法](docs/performance.md)
 - [压测报告](docs/benchmark_report.md)
+- [延迟采样专项对照](docs/metrics_benchmark.md)
 - [项目范围与收口状态](RPC_FRAMEWORK_ROADMAP.md)
 
 ## 当前限制

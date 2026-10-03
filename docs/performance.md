@@ -9,6 +9,8 @@ Coroutine + epoll + ThreadPool
 
 当前实测数据和环境信息见 [benchmark_report.md](benchmark_report.md)。
 
+延迟采样去锁的专项微基准、端到端对照与原始数据见 [metrics_benchmark.md](metrics_benchmark.md)。
+
 ## 负载模型
 
 `rpc_bench` 是同进程、闭环的端到端压测：benchmark 进程同时运行客户端和服务端，客户端收到上一条响应后才在同一连接发送下一条请求。
@@ -38,6 +40,25 @@ Coroutine + epoll + ThreadPool
 - `fail_sum`、`rej_sum`、`tout_sum`：所有轮的失败、拒绝和超时总数。
 - `statuses_sum`：所有轮的响应状态码分布；`0:500000` 表示 5 轮共 500000 个请求全部成功。
 
+## 粘包解码与 pipeline 专项
+
+`rpc_bench` 的负载模型是「每条连接最多一个在途请求」，测不到解码路径的粘包行为。
+`pipeline_bench` 覆盖这个缺口，分两个模式：
+
+- `--mode codec`：纯 codec 基准，不联网、不启服务端。固定 body 尺寸、扫描一次读入的粘包帧数，
+  量化 `RpcCodec::TryDecode` 中 `buffer.erase(0, frame_size)` 的搬移代价。
+  每轮把整份粘包 append 进同一个 buffer 再解空，复现服务端 `recv → append → 循环 decode`
+  的真实形态（buffer 常驻热缓存、capacity 复用、append 摊到每帧恒为 `frame_bytes`）。
+  `frames=1` 那行即纯解析基线，`move_ns` 随帧数增长就是 O(N²) 的直接证据。
+- `--mode socket`：端到端单连接，扫描在途请求数 K，观察 pipeline 深度对吞吐的影响。
+
+```sh
+docker exec minirpc-linux bash -c 'cd /work && cmake --build build -j --target pipeline_bench \
+  && build/pipeline_bench --mode both'
+```
+
+实测数据与后续动作见 [optimization_plan.md](optimization_plan.md) 的 P4（解码搬移）与 P9（`TCP_NODELAY`）。
+
 ## 指标闭环
 
 压测和运行时调试对应同一组服务端指标：
@@ -53,7 +74,7 @@ Coroutine + epoll + ThreadPool
 | `rejected_requests` | 服务端拒绝的请求数，属于 failed 子集 | 已记录 |
 | `pending_requests` | 等待 handler 或等待响应 terminal write completion 的请求数 | 已记录 |
 | `avg_latency` | 从收到请求到响应写成功/失败终态的全生命周期累计平均延迟 | 已记录 |
-| `p50/p95/p99_latency` | 最近最多 10000 条上述全生命周期延迟样本的分位数 | 已记录 |
+| `p50/p95/p99_latency` | 最多 10000 个原子槽保留的近期延迟样本分位数；并发时为近似窗口 | 已记录 |
 | `threadpool_queue_size` | 业务线程池当前排队长度 | 已记录 |
 
 `RpcMetrics::ToPrometheusText()` 和服务端 `MetricsText()` 导出 Prometheus 文本格式。`total_responses` 与请求终态分类彼此独立：响应写回失败会增加 `failed_requests`，但不会增加 `total_responses`。

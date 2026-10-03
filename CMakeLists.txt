@@ -10,6 +10,8 @@ option(MINIRPC_BUILD_EXAMPLES "Build miniRPC examples" ON)
 option(MINIRPC_BUILD_TESTS "Build miniRPC tests" ON)
 option(MINIRPC_BUILD_BENCHMARKS "Build miniRPC benchmarks" ON)
 
+include(GNUInstallDirs)
+
 find_package(Threads REQUIRED)
 find_package(Protobuf REQUIRED)
 
@@ -52,7 +54,8 @@ add_library(minirpc::minirpc ALIAS minirpc)
 
 target_include_directories(minirpc
     PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE
         ${CMAKE_CURRENT_BINARY_DIR}
 )
@@ -141,6 +144,11 @@ if(MINIRPC_BUILD_TESTS)
     add_test(NAME timer_queue_test COMMAND timer_queue_test)
     list(APPEND MINIRPC_TEST_TARGETS timer_queue_test)
 
+    add_executable(thread_pool_test tests/runtime/thread_pool_test.cpp)
+    target_link_libraries(thread_pool_test PRIVATE minirpc::minirpc)
+    add_test(NAME thread_pool_test COMMAND thread_pool_test)
+    list(APPEND MINIRPC_TEST_TARGETS thread_pool_test)
+
     add_executable(coroutine_io_context_test tests/runtime/coroutine_io_context_test.cpp)
     target_link_libraries(coroutine_io_context_test PRIVATE minirpc::minirpc)
     add_test(NAME coroutine_io_context_test COMMAND coroutine_io_context_test)
@@ -170,9 +178,52 @@ if(MINIRPC_BUILD_TESTS)
 endif()
 
 if(MINIRPC_BUILD_BENCHMARKS)
+    add_executable(metrics_bench benchmark/metrics_bench.cpp)
+    target_link_libraries(metrics_bench PRIVATE minirpc::minirpc)
+
     add_executable(rpc_bench benchmark/rpc_bench.cpp)
     target_link_libraries(rpc_bench PRIVATE minirpc::minirpc)
     target_compile_definitions(rpc_bench PRIVATE
         MINIRPC_GIT_REVISION="${MINIRPC_GIT_REVISION}"
     )
+
+    add_executable(pipeline_bench benchmark/pipeline_bench.cpp)
+    target_link_libraries(pipeline_bench PRIVATE minirpc::minirpc)
 endif()
+
+# ---- 安装与导出：让外部项目可以 find_package(miniRPC) ----
+include(CMakePackageConfigHelpers)
+
+install(TARGETS minirpc
+    EXPORT miniRPCTargets
+    ARCHIVE  DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY  DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME  DESTINATION ${CMAKE_INSTALL_BINDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+install(EXPORT miniRPCTargets
+    FILE miniRPCTargets.cmake
+    NAMESPACE minirpc::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/miniRPC
+)
+
+configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/miniRPCConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/miniRPCConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/miniRPC
+)
+
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/miniRPCConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMinorVersion
+)
+
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/miniRPCConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/miniRPCConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/miniRPC
+)

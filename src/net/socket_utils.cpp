@@ -3,6 +3,8 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 
 namespace minirpc {
@@ -22,6 +24,17 @@ bool SetNonBlocking(int fd, std::string* error) {
     if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
         if (error != nullptr) {
             *error = LastSocketError("fcntl(F_SETFL) failed", errno);
+        }
+        return false;
+    }
+    return true;
+}
+
+bool SetTcpNoDelay(int fd, std::string* error) {
+    const int enabled = 1;
+    if (::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) == -1) {
+        if (error != nullptr) {
+            *error = LastSocketError("setsockopt(TCP_NODELAY) failed", errno);
         }
         return false;
     }

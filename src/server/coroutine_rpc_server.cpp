@@ -220,6 +220,12 @@ void CoroutineRpcServer::AcceptLoop() {
                 return;
             }
 
+            // accepted socket 不继承监听 socket 的选项，必须单独设。
+            std::string nodelay_error;
+            if (!SetTcpNoDelay(client_fd, &nodelay_error)) {
+                ::close(client_fd);
+                continue;
+            }
             TrackClientFd(client_fd);
             io_->Spawn([this, client_fd] {
                 try {

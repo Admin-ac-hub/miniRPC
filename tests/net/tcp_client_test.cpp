@@ -1,7 +1,11 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cerrno>
 #include <cstring>
+#include <future>
+#include <limits>
+#include <string>
 #include <thread>
 
 #include <arpa/inet.h>
@@ -45,6 +49,16 @@ struct TinyListener {
         if (thread.joinable()) thread.join();
     }
 };
+
+void SendAllRaw(int fd, const std::string& data) {
+    std::size_t sent = 0;
+    while (sent < data.size()) {
+        const ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
+        if (n == -1 && errno == EINTR) continue;
+        assert(n > 0);
+        sent += static_cast<std::size_t>(n);
+    }
+}
 
 void TestConnectFailureOnDeadEndpoint() {
     minirpc::TcpClient client;
@@ -113,9 +127,151 @@ void TestSendAfterCloseFails() {
     listener.Stop();
 }
 
+void TestDefaultReadLimitRejectsOversizedHeader() {
+    TinyListener listener;
+    listener.Start(19313);
+    std::promise<minirpc::TcpClient::CloseReason> closed;
+    auto close_future = closed.get_future();
+    std::atomic<int> close_count{0};
+    std::atomic<int> frame_count{0};
+    minirpc::TcpClient client;
+    client.SetOnFrame([&](minirpc::ProtocolFrame) { frame_count.fetch_add(1); });
+    client.SetOnClose([&](minirpc::TcpClient::CloseReason reason, const std::string& message) {
+        assert(!message.empty());
+        assert(close_count.fetch_add(1) == 0);
+        closed.set_value(reason);
+    });
+    assert(client.Connect({"127.0.0.1", 19313}).ok());
+    listener.thread.join();
+
+    minirpc::ProtocolFrame frame;
+    frame.message_type = minirpc::MessageType::kResponse;
+    frame.body.assign(2 * 1024 * 1024, 'x');
+    minirpc::RpcCodec codec;
+    std::string header = codec.Encode(frame);
+    header.resize(minirpc::kProtocolHeaderSize);
+    assert(::send(listener.accepted_fd, header.data(), header.size(), MSG_NOSIGNAL) ==
+           static_cast<ssize_t>(header.size()));
+    assert(close_future.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    assert(close_future.get() == minirpc::TcpClient::CloseReason::kProtocolError);
+    assert(client.state() == minirpc::ConnectionState::kDisconnected);
+    client.Close();
+    listener.Stop();
+    assert(close_count.load() == 1);
+    assert(frame_count.load() == 0);
+}
+
+void TestInvalidReadLimitFailsBeforeConnecting() {
+    for (const std::size_t limit : {std::size_t{0}, minirpc::kProtocolHeaderSize - 1}) {
+        minirpc::TcpClientOptions options;
+        options.max_read_buffer_bytes = limit;
+        minirpc::TcpClient client(options);
+        const auto status = client.Connect({"127.0.0.1", 1});
+        assert(!status.ok());
+        assert(status.code() == minirpc::StatusCode::kNetworkError);
+        assert(status.message().find("max_read_buffer_bytes") != std::string::npos);
+        assert(client.state() == minirpc::ConnectionState::kDisconnected);
+    }
+}
+
+void TestConfiguredReadLimitAllowsFragmentedAndCoalescedFrames() {
+    const std::size_t limits[] = {
+        minirpc::kProtocolHeaderSize, 1024, 2 * 1024 * 1024, 3 * 1024 * 1024};
+    for (const std::size_t limit : limits) {
+        TinyListener listener;
+        listener.Start(19314);
+        minirpc::TcpClientOptions options;
+        options.max_read_buffer_bytes = limit;
+        minirpc::TcpClient client(options);
+        std::promise<void> received;
+        auto received_future = received.get_future();
+        int frame_count = 0;
+        client.SetOnFrame([&](minirpc::ProtocolFrame frame) {
+            ++frame_count;
+            assert(frame.request_id == static_cast<uint64_t>(frame_count));
+            const std::size_t expected_size = frame_count == 1
+                ? limit - minirpc::kProtocolHeaderSize : 0;
+            assert(frame.body == std::string(expected_size, 'x'));
+            if (frame_count == 3) received.set_value();
+        });
+        assert(client.Connect({"127.0.0.1", 19314}).ok());
+        listener.thread.join();
+        minirpc::RpcCodec codec;
+        minirpc::ProtocolFrame frame;
+        frame.message_type = minirpc::MessageType::kResponse;
+        frame.request_id = 1;
+        frame.body.assign(limit - minirpc::kProtocolHeaderSize, 'x');
+        std::string burst = codec.Encode(frame);
+        frame.body.clear();
+        frame.request_id = 2;
+        burst += codec.Encode(frame);
+        frame.request_id = 3;
+        burst += codec.Encode(frame);
+        assert(burst.size() > limit);
+        SendAllRaw(listener.accepted_fd, burst.substr(0, minirpc::kProtocolHeaderSize - 1));
+        SendAllRaw(listener.accepted_fd, burst.substr(minirpc::kProtocolHeaderSize - 1));
+        assert(received_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+        assert(client.state() == minirpc::ConnectionState::kConnected);
+        client.Close();
+        listener.Stop();
+        assert(frame_count == 3);
+    }
+}
+
+void TestConfiguredReadLimitRejectsOversizedFrameAndCanReconnect() {
+    const std::size_t limits[] = {1024, std::numeric_limits<std::size_t>::max()};
+    for (const std::size_t limit : limits) {
+        TinyListener listener;
+        listener.Start(19315);
+        minirpc::TcpClientOptions options;
+        options.max_read_buffer_bytes = limit;
+        minirpc::TcpClient client(options);
+        std::promise<minirpc::TcpClient::CloseReason> closed;
+        auto close_future = closed.get_future();
+        client.SetOnClose([&](minirpc::TcpClient::CloseReason reason, const std::string& message) {
+            assert(!message.empty());
+            closed.set_value(reason);
+        });
+        assert(client.Connect({"127.0.0.1", 19315}).ok());
+        listener.thread.join();
+        minirpc::RpcCodec codec;
+        minirpc::ProtocolFrame frame;
+        frame.body.assign(limit == 1024 ? limit - minirpc::kProtocolHeaderSize + 1
+                                       : minirpc::kDefaultMaxFrameBodySize + 1, 'x');
+        std::string header = codec.Encode(frame);
+        header.resize(minirpc::kProtocolHeaderSize);
+        SendAllRaw(listener.accepted_fd, header);
+        assert(close_future.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+        assert(close_future.get() == minirpc::TcpClient::CloseReason::kProtocolError);
+        client.Close();
+        listener.Stop();
+
+        TinyListener next_listener;
+        next_listener.Start(19315);
+        client.SetOnClose({});
+        std::promise<void> received;
+        auto received_future = received.get_future();
+        client.SetOnFrame([&](minirpc::ProtocolFrame decoded) {
+            assert(decoded.body == "reconnected");
+            received.set_value();
+        });
+        assert(client.Connect({"127.0.0.1", 19315}).ok());
+        next_listener.thread.join();
+        frame.body = "reconnected";
+        SendAllRaw(next_listener.accepted_fd, codec.Encode(frame));
+        assert(received_future.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+        client.Close();
+        next_listener.Stop();
+    }
+}
+
 }  // namespace
 
 int main() {
+    TestDefaultReadLimitRejectsOversizedHeader();
+    TestInvalidReadLimitFailsBeforeConnecting();
+    TestConfiguredReadLimitAllowsFragmentedAndCoalescedFrames();
+    TestConfiguredReadLimitRejectsOversizedFrameAndCanReconnect();
     TestConnectFailureOnDeadEndpoint();
     TestConnectSuccessThenIdempotent();
     TestPeerClosedFiresOnClose();
